@@ -1,0 +1,19 @@
+{
+  "tool": "apply_look_preset",
+  "source_path": "/Users/darwashi/clip-factory/broll/tbfpe-qimmw__clip04__ai02__veo.mp4",
+  "output_path": "/Users/darwashi/clip-factory/looklab/renders/tbfpe-qimmw-clip04-ai02-veo__cinematic-soft.mp4",
+  "kind": "video",
+  "settings": {
+    "preset": "cinematic-soft",
+    "contrast": 1.12,
+    "brightness": 0.02,
+    "saturation": 1.06,
+    "warmth": 0.01,
+    "sharpness": 0.55,
+    "grain": 0.02,
+    "vignette": 0.08,
+    "glow": 0.04,
+    "filter_chain": "eq=contrast=1.120:brightness=0.020:saturation=1.060,colorbalance=rs=0.010:gs=0.000:bs=-0.007,unsharp=5:5:0.550:5:5:0.0,split=2[base][blur];[blur]gblur=sigma=2.32[soft];[base][soft]blend=all_mode=screen:all_opacity=0.122,noise=alls=5:allf=t,vignette=angle=0.192",
+    "notes": "Soft premium contrast for reflective shorts."
+  }
+}

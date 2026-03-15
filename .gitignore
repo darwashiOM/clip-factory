@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+remotion/node_modules/
+
+# Logs
+logs/
+*.log
+
+# Generated media/artifacts
+clips/
+final/
+transcripts/
+incoming/
+broll/
+pool/
+
+# Misc
+*.tmp

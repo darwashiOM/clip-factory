@@ -1,0 +1,12 @@
+{
+  "accounts": {
+    "islamic-1": {
+      "platform": "tiktok",
+      "access_token": "XVKA3TUvBThw30TwkmYH4SdFS5QeYKPi",
+      "refresh_token": "",
+      "open_id": "",
+      "notes": "replace after TikTok OAuth"
+    }
+  },
+  "updated_at": ""
+}

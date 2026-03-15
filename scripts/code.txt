@@ -1,0 +1,123 @@
+ffmpeg -y \ 
+-i "$HOME/clip-factory/incoming/tbfpe_qimmw.mp4" \
+ -vn \
+ -ac 1 \
+ -ar 16000 \
+ -b:a 64k \ 
+"$HOME/clip-factory/incoming/tbfpe_qimmw.mp3"
+
+
+Use these MCPs in order as needed:
+clip-ops, transcribe, transcript-refiner, quran-guard, clip-finder, scene-director, broll-fetcher, asset-guard, look-lab, renderer, publisher, tiktok-publisher.
+
+Do not redownload anything.
+Do not rerun yt-dlp or ffmpeg extraction.
+The source files already exist:
+- incoming/tbfpe_qimmw.mp4
+- incoming/tbfpe_qimmw.mp3
+
+Stem: tbfpe_qimmw
+Language: Arabic
+max_clips: 5
+min_seconds: 20
+max_seconds: 59
+generation_count: 18
+scene_mode: balanced
+look_preset: golden-islamic
+render_top_n: 3
+transcribe_chunk_seconds: 600
+transcribe_overlap_seconds: 8
+
+Run this workflow:
+
+1. Verify health and confirm both source files exist
+- Use clip-ops first
+- Confirm incoming/tbfpe_qimmw.mp4 exists
+- Confirm incoming/tbfpe_qimmw.mp3 exists
+- Stop clearly if either file is missing
+
+2. Transcribe in Arabic using chunked transcription
+- Use transcribe
+- First run inspect_chunk_plan for file_name = "tbfpe_qimmw.mp3" with:
+  - chunk_seconds = 600
+  - overlap_seconds = 8
+- Then run transcribe_file for file_name = "tbfpe_qimmw.mp3" with:
+  - language = "ar"
+  - overwrite = false
+  - chunk_seconds = 600
+  - overlap_seconds = 8
+- Write the normal transcript outputs and continue using the merged final transcript artifacts
+- Report the created files, including the merged transcript outputs
+
+3. Refine transcript
+- Use transcript-refiner
+- Refine the transcript for stem tbfpe_qimmw
+- Preserve meaning and keep Arabic clean
+- Do not damage religious text
+
+4. Run quran-guard
+- Use quran-guard on tbfpe_qimmw after refinement
+- Prefer strict Quran correction behavior
+- Preserve non-Quran speech
+- Report which transcript artifact is now the best render source
+
+5. Run find_clips_from_stem for tbfpe_qimmw
+- Use:
+  - max_clips = 5
+  - min_seconds = 20
+  - max_seconds = 59
+  - generation_count = 18
+- Summarize the strongest candidates and why they work
+
+6. Build scenic visual plans with scene-director
+- Use mode = balanced
+- Start on original footage
+- Use only short scenic inserts
+- End on original footage
+- Scenic prompts must forbid:
+  - people
+  - faces
+  - animals
+  - text
+  - logos
+  - watermarks
+
+7. Generate scenic inserts with broll-fetcher
+- Generate the assets needed for the strongest clips
+- Keep outputs organized by clip
+
+8. Run asset-guard on every generated asset
+- Reject anything with:
+  - people
+  - faces
+  - animals
+  - text
+  - logos
+  - low quality
+  - visual artifacts
+  - non-scenic content
+- Clearly separate accepted vs rejected assets
+
+9. Use look-lab to match accepted scenic assets to the main footage
+- Apply a premium consistent look
+- Avoid overprocessing
+
+10. Render the strongest 3 clips
+- Burn subtitles into the output
+- Keep original spoken audio
+- Use accepted scenic assets only
+- Use auto_broll only when approved assets exist
+
+11. Prepare draft publishing metadata only
+- Use publisher and tiktok-publisher only for draft metadata
+- Do not publish
+
+Important rules:
+- no people
+- no faces
+- no animals
+- no text/logos
+- no publishing
+- no code changes
+- report every major step
+- return a structured summary of outputs, accepted/rejected assets, and best clip
