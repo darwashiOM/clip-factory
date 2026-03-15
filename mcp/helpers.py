@@ -34,10 +34,6 @@ from typing import List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from text_config import TextStyleConfig
 
-_TASHKEEL = re.compile(
-    r"[\u0610-\u061A\u064B-\u065F\u0640"
-    r"\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]"
-)
 
 _SENTENCE_BREAK_RE = re.compile(r"([،,:;؛.!?؟])")
 
@@ -184,11 +180,17 @@ def _choose_balanced_break(words: List[str], max_words_per_line: int, max_lines:
         return [words[:break_idx], words[break_idx:]]
 
     # Fallback: chunk by max_words_per_line, preferring punctuation cut points.
-    # Hard-cap at max_lines to prevent screen overflow.  Any words beyond the
-    # last line are silently dropped — screen overflow is worse than truncation.
+    #
+    # No-discard policy: silently dropping Quran canonical text is unacceptable.
+    # An extra line on screen is recoverable; missing words in a rendered verse
+    # are not.  We compute the minimum number of lines needed to hold all words
+    # and use that as the effective cap, clamped to a reasonable absolute ceiling
+    # (max_lines + 4).  The caller's max_lines is a soft target, not a hard kill.
+    needed = (len(words) + max_words_per_line - 1) // max(1, max_words_per_line)
+    effective_max = max(max_lines, min(needed, max_lines + 4))
     lines: List[List[str]] = []
     idx = 0
-    while idx < len(words) and len(lines) < max_lines:
+    while idx < len(words) and len(lines) < effective_max:
         remaining = len(words) - idx
         soft_max = min(max_words_per_line, remaining)
         chunk = words[idx:idx + soft_max]

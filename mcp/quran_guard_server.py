@@ -12,12 +12,21 @@ from typing import Optional, List, Tuple, Dict, Set, Any
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+# Two-phase bootstrap — see renderer_server_veo_timeline.py for full explanation.
+_INITIAL_ROOT = Path(
+    os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))
+).resolve()
+load_dotenv(_INITIAL_ROOT / ".env")
+
+ROOT = Path(
+    os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))
+).resolve()
+if ROOT != _INITIAL_ROOT and (ROOT / ".env").exists():
+    load_dotenv(ROOT / ".env", override=True)
+
 TRANSCRIPTS = ROOT / "transcripts"
 DATA_QURAN = ROOT / "data" / "quran"
 CORPUS_PATH = DATA_QURAN / "quran_corpus.json"
-
-load_dotenv(ROOT / ".env")
 
 mcp = FastMCP("clip-factory-quran-guard", json_response=True)
 
@@ -721,16 +730,16 @@ def _guard_segments(
         if best_window:
             win = best_window
             verse = win["verse"]
-            start = float(win["window_segments"][0]["start"])
-            end = float(win["window_segments"][-1]["end"])
+            window_start = float(win["window_segments"][0]["start"])
+            window_end = float(win["window_segments"][-1]["end"])
             render_text = win["render_text"]
             matched_span = list(win["span"]) if win["span"] else None
             canonical_uthmani = _choose_render_text(verse, "uthmani", span=win["span"])
 
             cues.append(
                 {
-                    "start": start,
-                    "end": end,
+                    "start": window_start,
+                    "end": window_end,
                     "text": render_text,
                     "is_quran_match": True,
                     "verse_key": verse.get("verse_key", ""),
@@ -741,8 +750,8 @@ def _guard_segments(
 
             matches.append(
                 {
-                    "start": start,
-                    "end": end,
+                    "start": window_start,
+                    "end": window_end,
                     "verse_key": verse.get("verse_key", ""),
                     "match_confidence": round(win["best_score"], 4),
                     "second_score": round(win["second_score"], 4),
@@ -765,6 +774,22 @@ def _guard_segments(
 
             for idx_in_window, seg in enumerate(win["window_segments"]):
                 seg_copy = dict(seg)
+
+                # ── Timing fix for multi-segment windows ──────────────────────
+                # The renderer iterates augmented_segments and creates one
+                # Dialogue line per non-empty text segment.  Segments 1..N-1
+                # carry empty text and are skipped.  Without this fix, segment 0
+                # keeps its original end time, causing the verse text to vanish
+                # too early (e.g. a window covering 10–16 s would only render
+                # 10–12 s if segment 0 originally ended at 12 s).
+                #
+                # Fix: extend segment 0's end to the full window end so the
+                # renderer produces a Dialogue line spanning the entire window.
+                # The SRT cue output above already has the correct timing; this
+                # aligns the verbose JSON to match it.
+                if idx_in_window == 0 and win["window_size"] > 1:
+                    seg_copy["end"] = window_end
+
                 seg_copy["quran_guard"] = {
                     "is_quran_match": True,
                     "verse_key": verse.get("verse_key", ""),
@@ -773,6 +798,11 @@ def _guard_segments(
                     "canonical_uthmani_text": canonical_uthmani,
                     "absorbed_into_previous_window_segment": idx_in_window > 0,
                     "render_text": render_text if idx_in_window == 0 else "",
+                    # window_start / window_end are stored for debugging and
+                    # to allow downstream tools to reconstruct full cue timing
+                    # without re-reading the SRT.
+                    "window_start": window_start,
+                    "window_end": window_end,
                     "match_mode": win["match_mode"],
                     "matched_span": matched_span,
                 }

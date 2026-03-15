@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 import json
 import re
+import datetime
 from typing import List, Optional, Dict, Tuple
 
 from dotenv import load_dotenv
@@ -9,59 +10,123 @@ from pydantic import BaseModel, Field
 from google import genai
 from mcp.server.fastmcp import FastMCP
 
-from helpers import atomic_write_json, merge_refined_and_quran_segments, segment_render_text
+# ── Bootstrap: resolve ROOT and load .env before any other import ─────────────
+# helpers must be imported AFTER dotenv so that any env-var-gated behaviour
+# in helpers (e.g. module-level constants) sees the correct values.
+# Two-phase so that CLIP_FACTORY_ROOT inside .env is respected.
+_INITIAL_ROOT = Path(
+    os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))
+).resolve()
+load_dotenv(_INITIAL_ROOT / ".env")
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+ROOT = Path(
+    os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))
+).resolve()
+if ROOT != _INITIAL_ROOT and (ROOT / ".env").exists():
+    load_dotenv(ROOT / ".env", override=True)
+
+# helpers imported here — AFTER dotenv — so text_config env vars are visible.
+from helpers import atomic_write_json, segment_render_text  # noqa: E402
+
 TRANSCRIPTS = ROOT / "transcripts"
 CLIPS = ROOT / "clips"
 
-load_dotenv(ROOT / ".env")
-
 mcp = FastMCP("clip-factory-scene-director", json_response=True)
 
+# ── Plan versioning ────────────────────────────────────────────────────────────
+# Bump when scheduling logic, style targets, or prompt policy changes so callers
+# can detect stale plans in candidates.json and know to re-run build_visual_plan.
+SCENE_PLAN_POLICY_VERSION: str = "2"
+
+# ── Renderer-compatible knobs ──────────────────────────────────────────────────
+# These mirror the renderer's own env vars so plans carry the rendering intent
+# they were designed for.  The renderer does NOT read these from scene plans
+# (it uses its own env), but storing them in the plan makes the design intent
+# explicit and allows future tooling to validate plan/renderer alignment.
+
+# Transition settings — must match RENDER_TRANSITION_TYPE / RENDER_TRANSITION_DURATION
+# in the renderer's .env for dissolves to feel intentional.
+_RENDER_TRANSITION_T: float = float(
+    os.environ.get("RENDER_TRANSITION_DURATION", "0.0")
+)
+_RENDER_TRANSITION_TYPE: str = (
+    os.environ.get("RENDER_TRANSITION_TYPE", "dissolve").strip().lower() or "dissolve"
+)
+
+# Recommended renderer color-grade preset for this planning style.
+# Matches the "dark-soft-recitation" preset in renderer_server_veo_timeline.py.
+# Override via SCENE_RECOMMENDED_PRESET in .env when using a different preset.
+_RECOMMENDED_PRESET: str = (
+    os.environ.get("SCENE_RECOMMENDED_PRESET", "dark-soft-recitation").strip()
+    or "dark-soft-recitation"
+)
+
+# Text readability hint.  "dark" tells the renderer the scenic beats are intended
+# to be underexposed so white/cream text is readable without adaptive sampling.
+# Values: dark | neutral | bright.
+_DARKNESS_INTENT: str = (
+    os.environ.get("SCENE_DARKNESS_INTENT", "dark").strip().lower() or "dark"
+)
+
+# ── Blocked visual terms ───────────────────────────────────────────────────────
 BLOCKED_VISUAL_TERMS = {
-    "people", "person", "human", "humans", "man", "men", "woman", "women", "child", "children",
-    "boy", "girl", "face", "faces", "hand", "hands", "body", "bodies", "crowd", "crowds", "silhouette",
-    "speaker", "presenter", "talking head", "portrait", "selfie", "animal", "animals", "bird", "birds",
-    "cat", "cats", "dog", "dogs", "horse", "horses", "camel", "camels", "insect", "insects",
+    "people", "person", "human", "humans", "man", "men", "woman", "women",
+    "child", "children", "boy", "girl", "face", "faces", "hand", "hands",
+    "body", "bodies", "crowd", "crowds", "silhouette", "speaker", "presenter",
+    "talking head", "portrait", "selfie",
+    "animal", "animals", "bird", "birds", "cat", "cats", "dog", "dogs",
+    "horse", "horses", "camel", "camels", "insect", "insects",
     "logo", "logos", "text", "words", "letters", "caption", "captions",
-    "شخص", "اشخاص", "إنسان", "انسان", "ناس", "رجل", "امرأة", "امراه", "طفل", "أطفال", "اطفال",
-    "وجه", "وجوه", "يد", "أيدي", "ايدي", "حيوان", "حيوانات", "طير", "طيور", "شعار", "نص"
+    "شخص", "اشخاص", "إنسان", "انسان", "ناس", "رجل", "امرأة", "امراه",
+    "طفل", "أطفال", "اطفال", "وجه", "وجوه", "يد", "أيدي", "ايدي",
+    "حيوان", "حيوانات", "طير", "طيور", "شعار", "نص",
 }
 
+# ── Fallback prompts ───────────────────────────────────────────────────────────
+# Aligned with the target look: dark, soft, slow-moving, spiritually resonant.
+# These are used when Gemini is unavailable or the clip has no usable text.
 SCENIC_FALLBACKS = [
-    "empty mosque courtyard at dawn",
-    "desert dunes at sunrise",
-    "moonlit prayer hall interior",
-    "ocean waves at dusk",
-    "rain on window at night",
-    "mountain mist at sunrise",
-    "lantern-lit stone alley with no people",
-    "empty road under dramatic clouds",
+    "dark stone mosque corridor at night, warm amber lantern light on ancient carved walls",
+    "slow-moving river at deep blue dusk, mist settling on still dark water",
+    "moonlit desert at night, long dune shadows, absolute stillness, no horizon line",
+    "empty prayer hall at pre-dawn, dim hanging lanterns casting soft circles of light",
+    "rain-streaked dark window at night, soft street light refracting through drops",
+    "ancient stone minaret against deep violet twilight sky, no movement except clouds",
+    "candle flame in a dark stone alcove, soft gold light on Islamic geometric carving",
+    "mist rolling slowly over mountain ridgeline at dawn, dark foreground, pale sky",
 ]
 
+
+# ── Pydantic models ────────────────────────────────────────────────────────────
 
 class PromptIdea(BaseModel):
     topic: str = Field(description="Short scenic topic")
     prompt: str = Field(description="Final scenic video prompt")
     reason: str = Field(description="Why this scene matches the clip")
-    energy: str = Field(description="One-word pacing feel such as calm, intense, reflective")
+    energy: str = Field(description="One-word pacing feel: calm, reflective, awe, solemn, hopeful")
 
 
 class PromptSet(BaseModel):
     summary: str = Field(description="One-sentence summary of the clip's emotional center")
-    mood: str = Field(description="Short mood label")
+    mood: str = Field(description="Short mood label — 1 to 3 words")
     scene_prompts: List[PromptIdea] = Field(default_factory=list)
 
 
 class VisualBeat(BaseModel):
-    type: str = Field(description="Either 'original' or 'ai_video'")
+    # type is open to three values so stock footage can be planned alongside AI.
+    type: str = Field(
+        description=(
+            "Beat source: 'original' (speaker/reciter footage), "
+            "'ai_video' (AI-generated scenic insert), "
+            "'stock_video' (real scenic stock clip)"
+        )
+    )
     start_offset_sec: float = Field(ge=0, description="Segment start relative to clip start")
     end_offset_sec: float = Field(gt=0, description="Segment end relative to clip start")
-    duration_sec: float = Field(gt=0, description="Segment duration")
-    asset_slot: int = Field(default=0, ge=0, description="1-based slot for ai_video beats, else 0")
-    prompt: str = Field(default="", description="Prompt for ai_video beat")
-    notes: str = Field(default="", description="Notes for renderer or fetcher")
+    duration_sec: float = Field(gt=0, description="Segment duration in seconds")
+    asset_slot: int = Field(default=0, ge=0, description="1-based slot for non-original beats; 0 for original")
+    prompt: str = Field(default="", description="Generation prompt for ai_video beats; asset path hint for stock_video beats")
+    notes: str = Field(default="", description="Renderer notes: energy:reason or fetcher instructions")
 
 
 class RatioDecision(BaseModel):
@@ -76,6 +141,16 @@ class RatioDecision(BaseModel):
 
 
 class VisualPlanEnvelope(BaseModel):
+    """
+    Complete scene plan written to {stem}__clip{N}.scene_plan.json.
+
+    Fields added in plan_policy_version 2:
+      visual_mode, plan_policy_version, transition_style,
+      transition_duration_sec, recommended_preset, darkness_intent.
+
+    These are advisory — the renderer uses its own .env values — but storing
+    them in the plan makes the design intent explicit and detectable.
+    """
     source_stem: str
     clip_number: int
     clip_title: str
@@ -88,6 +163,31 @@ class VisualPlanEnvelope(BaseModel):
     mood: str
     prompts: List[PromptIdea]
     visual_plan: List[VisualBeat]
+    # ── renderer-compatible metadata (v2) ─────────────────────────────────────
+    visual_mode: str = Field(
+        default="mixed_ai",
+        description="Derived from beat types: speaker_only | mixed_ai | mixed_stock | mixed",
+    )
+    plan_policy_version: str = Field(
+        default="1",
+        description="Bumped when scheduling logic changes; helps detect stale plans",
+    )
+    transition_style: str = Field(
+        default="dissolve",
+        description="Recommended xfade type for the renderer (dissolve, fade, …)",
+    )
+    transition_duration_sec: float = Field(
+        default=0.4,
+        description="Recommended xfade duration the plan was sized for",
+    )
+    recommended_preset: str = Field(
+        default="dark-soft-recitation",
+        description="Recommended renderer color-grade preset",
+    )
+    darkness_intent: str = Field(
+        default="dark",
+        description="Text readability hint: dark | neutral | bright",
+    )
 
 
 class MatchScore(BaseModel):
@@ -201,30 +301,48 @@ def _load_verbose_json(path: Path) -> Optional[dict]:
         return None
 
 
-def _load_transcript_segments(stem: str) -> List[dict]:
-    refined = _load_verbose_json(TRANSCRIPTS / f"{stem}.refined.verbose.json")
-    quran = _load_verbose_json(TRANSCRIPTS / f"{stem}.quran_guard.verbose.json")
-    plain = _load_verbose_json(TRANSCRIPTS / f"{stem}.verbose.json")
+def _load_transcript_segments(stem: str, clip_number: Optional[int] = None) -> List[dict]:
+    """
+    Load the best available transcript segments for a stem (and optionally a
+    specific clip).
 
-    refined_segments = (refined or {}).get("segments") or []
-    quran_segments = (quran or {}).get("segments") or []
-    plain_segments = (plain or {}).get("segments") or []
+    Priority mirrors renderer_server_veo_timeline._load_transcript_segments:
+      clip-level (if clip_number is given):
+        1. {clip}.quran_guard.verbose.json  — corpus-canonical text
+        2. {clip}.refined.verbose.json      — Gemini-corrected ASR
+      stem-level fallback:
+        3. {stem}.quran_guard.verbose.json
+        4. {stem}.refined.verbose.json
+        5. {stem}.verbose.json              — raw Whisper transcription
 
-    if refined_segments and quran_segments:
-        merged = merge_refined_and_quran_segments(refined_segments, quran_segments)
-        if merged:
-            return merged
-    if quran_segments:
-        return quran_segments
-    if refined_segments:
-        return refined_segments
-    return plain_segments
+    Clip-level files are checked first so scene_director uses the same
+    canonical text that the renderer will use for subtitle generation.
+    """
+    candidates = []
+    if clip_number is not None:
+        clip_stem = f"{stem}__clip{clip_number:02d}"
+        candidates += [
+            TRANSCRIPTS / f"{clip_stem}.quran_guard.verbose.json",
+            TRANSCRIPTS / f"{clip_stem}.refined.verbose.json",
+        ]
+    candidates += [
+        TRANSCRIPTS / f"{stem}.quran_guard.verbose.json",
+        TRANSCRIPTS / f"{stem}.refined.verbose.json",
+        TRANSCRIPTS / f"{stem}.verbose.json",
+    ]
+    for candidate in candidates:
+        data = _load_verbose_json(candidate)
+        if data:
+            segs = data.get("segments") or []
+            if segs:
+                return segs
+    return []
 
 
-def _segments_for_clip(stem: str, clip: dict) -> List[dict]:
+def _segments_for_clip(stem: str, clip: dict, clip_number: Optional[int] = None) -> List[dict]:
     start = _safe_float(clip.get("start_sec"), 0.0)
     end = _safe_float(clip.get("end_sec"), 0.0)
-    segments = _load_transcript_segments(stem)
+    segments = _load_transcript_segments(stem, clip_number=clip_number)
     selected = []
     for seg in segments:
         seg_start = _safe_float(seg.get("start"), 0.0)
@@ -235,9 +353,9 @@ def _segments_for_clip(stem: str, clip: dict) -> List[dict]:
     return selected
 
 
-def _clip_text(stem: str, clip: dict) -> str:
+def _clip_text(stem: str, clip: dict, clip_number: Optional[int] = None) -> str:
     parts = []
-    for seg in _segments_for_clip(stem, clip):
+    for seg in _segments_for_clip(stem, clip, clip_number=clip_number):
         txt = str(segment_render_text(seg) or "").replace("\n", " ").strip()
         if txt:
             parts.append(txt)
@@ -270,7 +388,8 @@ def _sanitize_visual_topic(topic: str) -> str:
         return SCENIC_FALLBACKS[0]
     lowered = topic.lower()
     for blocked in BLOCKED_VISUAL_TERMS:
-        lowered = lowered.replace(blocked, " ")
+        # Word-boundary match so "man-made" doesn't become "-made".
+        lowered = re.sub(r"\b" + re.escape(blocked) + r"\b", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip(" ,.-")
     if not lowered:
         return SCENIC_FALLBACKS[0]
@@ -278,18 +397,29 @@ def _sanitize_visual_topic(topic: str) -> str:
 
 
 def _enforce_prompt(prompt: str) -> str:
+    """
+    Sanitize a scenic prompt and append the mandatory cinematic suffix.
+
+    Uses word-boundary matching for blocked terms so compound words like
+    "man-made" are not corrupted.  The suffix encodes the target look:
+    dark, soft, slightly underexposed, slow natural motion.
+    """
     prompt = str(prompt or "").strip()
     prompt = re.sub(r"\s+", " ", prompt)
     lowered = prompt.lower()
+    # Sort by length descending so longer phrases match before their subwords.
     for blocked in sorted(BLOCKED_VISUAL_TERMS, key=len, reverse=True):
-        lowered = lowered.replace(blocked, " ")
+        lowered = re.sub(r"\b" + re.escape(blocked) + r"\b", " ", lowered)
     lowered = re.sub(r"\s+", " ", lowered).strip(" ,.-")
     if not lowered:
         lowered = SCENIC_FALLBACKS[0]
+    # Suffix encodes the target visual style so downstream generators receive
+    # it even if the upstream Gemini call did not include it explicitly.
     suffix = (
-        " photorealistic, cinematic, subtle natural motion, vertical 9:16, "
-        "empty environment only, no people, no human faces, no hands, no animals, "
-        "no birds, no insects, no text, no logos."
+        " photorealistic, cinematic, dark and soft, slightly underexposed, "
+        "slow subtle natural motion, vertical 9:16, empty environment only, "
+        "no people, no human faces, no hands, no animals, no birds, "
+        "no insects, no text, no logos, smooth gradual movement only."
     )
     if lowered.endswith("."):
         lowered = lowered[:-1]
@@ -297,6 +427,13 @@ def _enforce_prompt(prompt: str) -> str:
 
 
 def _fallback_prompt_set(clip: dict, beat_count: int) -> PromptSet:
+    """
+    Build a PromptSet from clip metadata when Gemini is unavailable.
+
+    Falls back to SCENIC_FALLBACKS (dark, atmospheric) rather than generic
+    landscape terms.  Tries clip broll_query and title first for relevance,
+    then rotates through SCENIC_FALLBACKS to fill remaining beats.
+    """
     bases = [
         _sanitize_visual_topic(clip.get("broll_query") or ""),
         _sanitize_visual_topic(clip.get("title") or ""),
@@ -304,69 +441,92 @@ def _fallback_prompt_set(clip: dict, beat_count: int) -> PromptSet:
     ]
     bases = [b for b in bases if b]
     if not bases:
-        bases = SCENIC_FALLBACKS[:]
+        bases = list(SCENIC_FALLBACKS)
 
     prompts: List[PromptIdea] = []
-    seen = set()
+    seen: set = set()
     idx = 0
+    fallback_idx = 0
     while len(prompts) < beat_count:
-        base = bases[idx % len(bases)] if idx < len(bases) else SCENIC_FALLBACKS[idx % len(SCENIC_FALLBACKS)]
-        topic = _sanitize_visual_topic(base)
-        if topic in seen:
+        if idx < len(bases):
+            topic = _sanitize_visual_topic(bases[idx])
             idx += 1
+        else:
+            topic = _sanitize_visual_topic(SCENIC_FALLBACKS[fallback_idx % len(SCENIC_FALLBACKS)])
+            fallback_idx += 1
+        if not topic or topic in seen:
             continue
         seen.add(topic)
         prompts.append(
             PromptIdea(
                 topic=topic,
                 prompt=_enforce_prompt(topic),
-                reason="Fallback scenic prompt derived from clip metadata",
+                reason="Atmospheric fallback aligned with dark-soft cinematic style",
                 energy="reflective",
             )
         )
-        idx += 1
 
     return PromptSet(
-        summary=str(clip.get("why_it_works") or clip.get("title") or "Scenic reinforcement").strip() or "Scenic reinforcement",
+        summary=str(clip.get("why_it_works") or clip.get("title") or "Scenic reinforcement").strip()
+        or "Scenic reinforcement",
         mood="reflective",
         scene_prompts=prompts,
     )
 
 
-def _build_prompt_generation_request(stem: str, clip_number: int, clip: dict, clip_text: str, beat_count: int, mode: str) -> str:
+def _build_prompt_generation_request(
+    stem: str, clip_number: int, clip: dict, clip_text: str, beat_count: int, mode: str
+) -> str:
     return f"""
-You are a scene director for Arabic short-form videos.
+You are a scene director for Arabic short-form vertical videos.
 
 Return ONLY valid JSON matching the schema.
-No markdown.
-No explanations outside JSON.
+No markdown. No explanations outside JSON.
 
-Your job is to create {beat_count} scenic insert ideas for a short vertical video.
-These inserts must be symbolic or environmental only.
+Your job: create {beat_count} scenic insert ideas for a short vertical video of Arabic recitation or Islamic teaching.
 
-NON-NEGOTIABLE RULES:
-- Never include humans, faces, hands, children, crowds, silhouettes, presenters, speakers, or any character action.
+═══════════════════════════════════════════════════
+NON-NEGOTIABLE SAFETY RULES
+═══════════════════════════════════════════════════
+- Never include humans, faces, hands, children, crowds, silhouettes, or any character action.
 - Never include animals, birds, insects, or any living creature.
-- Never include text, logos, signage text, UI, captions, calligraphy, or readable writing.
-- Prefer empty architecture, weather, sky, water, dunes, roads, windows, light, mist, shadows, lanterns, and atmosphere.
-- Every prompt must be suitable for cinematic short video generation.
-- Prompts must be specific enough to visualize, but not cluttered.
-- Prompts must be in English because the generation layer uses English prompts best.
+- Never include text, logos, signage, calligraphy, readable writing, or UI elements.
+- If a prompt breaks these rules, replace it with a dark atmospheric scene from nature or architecture.
 
-EDITORIAL GOAL:
-- Keep the original sermon footage as the backbone.
-- Scenic inserts should amplify emotion, reflection, warning, awe, calm, or payoff.
-- Do not summarize the speech literally. Find visual metaphors and matching atmosphere.
-- Make adjacent prompts feel visually different from each other.
+═══════════════════════════════════════════════════
+TARGET VISUAL STYLE — READ CAREFULLY
+═══════════════════════════════════════════════════
+The final video has Arabic text burned over the footage in cream/white.
+The scenic inserts must act as a DARK CANVAS for that text.
 
-OUTPUT RULES:
-- summary: 1 sentence about the emotional center of the clip
-- mood: 1 to 3 words only
+This means:
+- Scenes must be dark, soft, and slightly underexposed — never bright or saturated.
+- Preferred lighting: blue hour, deep dusk, pre-dawn, night, interior lantern light.
+- Preferred subjects: empty mosque interiors, water at night, mist, stone architecture,
+  desert at night, dark skies, rain on glass, candle or lantern light, deep shadows.
+- Avoid: noon daylight, bright sky, white sand in sun, bright green nature, busy patterns.
+- Motion must be SLOW and SUBTLE — drifting mist, gentle water, rising smoke, drifting clouds.
+  Fast motion, rapid cuts, or chaotic movement are wrong for this context.
+- Every scene should feel spiritually weighty and contemplative — not decorative.
+
+═══════════════════════════════════════════════════
+EDITORIAL GOAL
+═══════════════════════════════════════════════════
+- The speaker/reciter footage is the backbone — inserts should deepen the feeling, not distract.
+- Each insert should be a visual metaphor for the spoken meaning, NOT a literal illustration.
+- Adjacent inserts must feel visually different from each other (different subject, different light).
+- Match the emotional arc: awe → reflection → payoff. Do not frontload the heaviest imagery.
+
+═══════════════════════════════════════════════════
+OUTPUT RULES
+═══════════════════════════════════════════════════
+- summary: 1 sentence about the emotional center of this clip
+- mood: 1 to 3 words, lowercase
 - scene_prompts: exactly {beat_count} items
-- topic: 2 to 6 words
-- prompt: 1 sentence, English, scenic only, no blocked content
-- reason: very short
-- energy: one word like calm, intense, reflective, urgent, hopeful
+- topic: 2 to 6 words, English
+- prompt: 1 sentence, English, scenic only, dark-soft style, no blocked content
+- reason: very short, why this scene fits this specific moment
+- energy: one word — calm, awe, solemn, reflective, hopeful, or urgent
 
 Mode: {mode}
 Source stem: {stem}
@@ -375,15 +535,15 @@ Clip title: {clip.get('title', '')}
 Clip hook: {clip.get('hook', '')}
 Clip why_it_works: {clip.get('why_it_works', '')}
 Clip broll_query: {clip.get('broll_query', '')}
-Clip duration: {_clip_duration(clip)}
+Clip duration: {_clip_duration(clip)}s
 
-Clip transcript excerpt:
+Clip transcript excerpt (Arabic — use for emotional/thematic context only):
 {_trim_excerpt(clip_text, 2400)}
 """.strip()
 
 
 def _generate_prompt_set(stem: str, clip_number: int, clip: dict, beat_count: int, mode: str) -> PromptSet:
-    clip_text = _clip_text(stem, clip)
+    clip_text = _clip_text(stem, clip, clip_number=clip_number)
     if not clip_text:
         return _fallback_prompt_set(clip, beat_count)
 
@@ -391,7 +551,9 @@ def _generate_prompt_set(stem: str, clip_number: int, clip: dict, beat_count: in
         client = _client()
         response = client.models.generate_content(
             model=_model_name(),
-            contents=_build_prompt_generation_request(stem, clip_number, clip, clip_text, beat_count, mode),
+            contents=_build_prompt_generation_request(
+                stem, clip_number, clip, clip_text, beat_count, mode
+            ),
             config={
                 "response_mime_type": "application/json",
                 "response_json_schema": PromptSet.model_json_schema(),
@@ -416,7 +578,9 @@ def _generate_prompt_set(stem: str, clip_number: int, clip: dict, beat_count: in
             fallback = _fallback_prompt_set(clip, beat_count).scene_prompts[len(cleaned)]
             cleaned.append(fallback)
         return PromptSet(
-            summary=str(prompt_set.summary or clip.get("why_it_works") or clip.get("title") or "Scenic reinforcement").strip() or "Scenic reinforcement",
+            summary=str(
+                prompt_set.summary or clip.get("why_it_works") or clip.get("title") or "Scenic reinforcement"
+            ).strip() or "Scenic reinforcement",
             mood=str(prompt_set.mood or "reflective").strip() or "reflective",
             scene_prompts=cleaned[:beat_count],
         )
@@ -452,6 +616,12 @@ def _decide_ratio(duration_sec: float, mode: str = "balanced") -> RatioDecision:
         intro_guard = 1.9
         outro_guard = 2.0
 
+    # Pad beat length so the fully-visible scenic window equals the intended
+    # ai_len after both dissolve edges are consumed by xfade.
+    # Example: ai_len=1.7, T=0.4 → stored beat=2.5s → visible=1.7s ✓
+    # When _RENDER_TRANSITION_T=0.0 (default), no padding is applied.
+    ai_len = round(ai_len + 2.0 * _RENDER_TRANSITION_T, 2)
+
     scenic_total = min(duration_sec * 0.42, insert_count * ai_len)
     original_total = max(0.0, duration_sec - scenic_total)
     return RatioDecision(
@@ -466,7 +636,9 @@ def _decide_ratio(duration_sec: float, mode: str = "balanced") -> RatioDecision:
     )
 
 
-def _schedule_visual_plan(duration_sec: float, prompts: List[PromptIdea], mode: str = "balanced") -> List[VisualBeat]:
+def _schedule_visual_plan(
+    duration_sec: float, prompts: List[PromptIdea], mode: str = "balanced"
+) -> List[VisualBeat]:
     ratio = _decide_ratio(duration_sec, mode=mode)
     duration = ratio.duration_sec
     prompt_count = min(len(prompts), ratio.insert_count)
@@ -560,6 +732,29 @@ def _schedule_visual_plan(duration_sec: float, prompts: List[PromptIdea], mode: 
     return [beat for beat in beats if beat.duration_sec > 0.2]
 
 
+def _derive_visual_mode(plan: List[VisualBeat]) -> str:
+    """
+    Derive the visual_mode string from the actual beat types in a plan.
+
+    Replaces the old hardcoded "alternate_scenic" with a value that describes
+    what the plan actually contains:
+      speaker_only  — all original footage
+      mixed_ai      — original + AI-generated scenic inserts
+      mixed_stock   — original + real stock scenic clips
+      mixed         — original + both AI and stock clips
+    """
+    types = {b.type for b in plan}
+    has_ai = "ai_video" in types
+    has_stock = "stock_video" in types
+    if has_ai and has_stock:
+        return "mixed"
+    if has_ai:
+        return "mixed_ai"
+    if has_stock:
+        return "mixed_stock"
+    return "speaker_only"
+
+
 def _score_prompt_against_text(prompt: str, clip_text: str) -> MatchScore:
     prompt_tokens = set(_tokenize(prompt))
     clip_tokens = set(_tokenize(clip_text))
@@ -567,7 +762,10 @@ def _score_prompt_against_text(prompt: str, clip_text: str) -> MatchScore:
 
     score = 0.35
     score += min(0.35, len(matched) * 0.08)
-    if any(tok in prompt.lower() for tok in ["dawn", "night", "rain", "ocean", "desert", "mist", "mosque", "courtyard"]):
+    if any(
+        tok in prompt.lower()
+        for tok in ["dawn", "night", "rain", "ocean", "desert", "mist", "mosque", "courtyard", "dusk", "dark"]
+    ):
         score += 0.1
     if "no people" in prompt.lower() and "no animals" in prompt.lower():
         score += 0.1
@@ -585,9 +783,11 @@ def _get_clip(stem: str, clip_number: int) -> Tuple[dict, dict, List[dict]]:
     if clip_number < 1 or clip_number > len(clips):
         raise ValueError(f"clip_number must be between 1 and {len(clips)}")
     clip = clips[clip_number - 1]
-    clip_segments = _segments_for_clip(stem, clip)
+    clip_segments = _segments_for_clip(stem, clip, clip_number=clip_number)
     return data, clip, clip_segments
 
+
+# ── MCP tools ──────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def healthcheck() -> dict:
@@ -611,11 +811,7 @@ def list_candidate_plans(limit: int = 50) -> dict:
     return CandidateFileList(
         folder=str(CLIPS),
         files=[
-            {
-                "name": p.name,
-                "path": str(p),
-                "size_bytes": p.stat().st_size,
-            }
+            {"name": p.name, "path": str(p), "size_bytes": p.stat().st_size}
             for p in files[:limit]
         ],
     ).model_dump()
@@ -624,7 +820,8 @@ def list_candidate_plans(limit: int = 50) -> dict:
 @mcp.tool()
 def inspect_clip_context(stem: str, clip_number: int) -> dict:
     _, clip, clip_segments = _get_clip(stem, clip_number)
-    excerpt = _trim_excerpt(_clip_text(stem, clip), 1800)
+    # Pass clip_number so clip-level transcript is preferred over stem-level.
+    excerpt = _trim_excerpt(_clip_text(stem, clip, clip_number=clip_number), 1800)
     return ClipContext(
         source_stem=stem,
         clip_number=clip_number,
@@ -661,20 +858,31 @@ def decide_original_vs_scenic_ratio(duration_sec: float, mode: str = "balanced")
 def suggest_cut_timeline(duration_sec: float, mode: str = "balanced") -> dict:
     ratio = _decide_ratio(duration_sec, mode=mode)
     dummy_prompts = [
-        PromptIdea(topic=f"scene {i}", prompt=_enforce_prompt(f"scenic environment {i}"), reason="preview", energy="reflective")
+        PromptIdea(
+            topic=f"scene {i}",
+            prompt=_enforce_prompt(f"dark atmospheric scenic environment {i}"),
+            reason="preview",
+            energy="reflective",
+        )
         for i in range(1, ratio.insert_count + 1)
     ]
     beats = _schedule_visual_plan(duration_sec, dummy_prompts, mode=mode)
-    return TimelinePreview(duration_sec=round(duration_sec, 2), mode=ratio.mode, beats=beats).model_dump()
+    return TimelinePreview(
+        duration_sec=round(duration_sec, 2), mode=ratio.mode, beats=beats
+    ).model_dump()
 
 
 @mcp.tool()
 def generate_scenic_prompts(stem: str, clip_number: int, mode: str = "balanced") -> dict:
     _, clip, _ = _get_clip(stem, clip_number)
     ratio = _decide_ratio(_clip_duration(clip), mode=mode)
-    prompt_set = _generate_prompt_set(stem, clip_number, clip, beat_count=ratio.insert_count, mode=ratio.mode)
+    prompt_set = _generate_prompt_set(
+        stem, clip_number, clip, beat_count=ratio.insert_count, mode=ratio.mode
+    )
     matches = [
-        _score_prompt_against_text(idea.prompt, _clip_text(stem, clip)).model_dump()
+        _score_prompt_against_text(
+            idea.prompt, _clip_text(stem, clip, clip_number=clip_number)
+        ).model_dump()
         for idea in prompt_set.scene_prompts
     ]
     return {
@@ -692,7 +900,9 @@ def generate_scenic_prompts(stem: str, clip_number: int, mode: str = "balanced")
 @mcp.tool()
 def score_visual_match_to_script(stem: str, clip_number: int, prompt: str) -> dict:
     _, clip, _ = _get_clip(stem, clip_number)
-    score = _score_prompt_against_text(prompt, _clip_text(stem, clip))
+    score = _score_prompt_against_text(
+        prompt, _clip_text(stem, clip, clip_number=clip_number)
+    )
     return {
         "ok": True,
         "source_stem": stem,
@@ -710,11 +920,28 @@ def build_visual_plan(
     overwrite: bool = True,
     update_candidates: bool = True,
 ) -> dict:
+    """
+    Generate a visual scene plan for one clip and write it to disk.
+
+    Writes two artifacts:
+      {stem}__clip{N}.scene_plan.json   — full VisualPlanEnvelope (always)
+      {stem}.candidates.json            — mutates the clip entry (if update_candidates=True)
+
+    Candidate mutation writes only the fields owned by scene_director:
+      visual_mode, visual_summary, visual_mood, visual_ratio, visual_prompts,
+      visual_plan, plan_policy_version, plan_generated_at.
+
+    broll_query is left unchanged if already present — it is set by the upstream
+    clip selection pipeline and scene_director should not overwrite it.
+    """
     data, clip, _ = _get_clip(stem, clip_number)
     duration = _clip_duration(clip)
     ratio = _decide_ratio(duration, mode=mode)
-    prompt_set = _generate_prompt_set(stem, clip_number, clip, beat_count=ratio.insert_count, mode=ratio.mode)
+    prompt_set = _generate_prompt_set(
+        stem, clip_number, clip, beat_count=ratio.insert_count, mode=ratio.mode
+    )
     plan = _schedule_visual_plan(duration, prompt_set.scene_prompts, mode=ratio.mode)
+    derived_mode = _derive_visual_mode(plan)
 
     envelope = VisualPlanEnvelope(
         source_stem=stem,
@@ -729,6 +956,12 @@ def build_visual_plan(
         mood=prompt_set.mood,
         prompts=prompt_set.scene_prompts,
         visual_plan=plan,
+        visual_mode=derived_mode,
+        plan_policy_version=SCENE_PLAN_POLICY_VERSION,
+        transition_style=_RENDER_TRANSITION_TYPE,
+        transition_duration_sec=_RENDER_TRANSITION_T,
+        recommended_preset=_RECOMMENDED_PRESET,
+        darkness_intent=_DARKNESS_INTENT,
     )
 
     plan_path = CLIPS / f"{stem}__clip{clip_number:02d}.scene_plan.json"
@@ -744,12 +977,17 @@ def build_visual_plan(
     if update_candidates:
         clips = data.get("clips") or []
         clip_ref = clips[clip_number - 1]
-        clip_ref["visual_mode"] = "alternate_scenic"
+        # Write only scene_director-owned fields.  Do not blast unrelated fields.
+        clip_ref["visual_mode"] = derived_mode          # was hardcoded "alternate_scenic"
         clip_ref["visual_summary"] = prompt_set.summary
         clip_ref["visual_mood"] = prompt_set.mood
         clip_ref["visual_ratio"] = ratio.model_dump()
         clip_ref["visual_prompts"] = [idea.model_dump() for idea in prompt_set.scene_prompts]
         clip_ref["visual_plan"] = [beat.model_dump() for beat in plan]
+        clip_ref["plan_policy_version"] = SCENE_PLAN_POLICY_VERSION
+        clip_ref["plan_generated_at"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Only set broll_query if the clip does not already have one.
+        # broll_query is owned by the upstream clip-selection pipeline.
         if not clip_ref.get("broll_query") and prompt_set.scene_prompts:
             clip_ref["broll_query"] = prompt_set.scene_prompts[0].topic
         atomic_write_json(_candidate_file_path(stem), data, ensure_ascii=False)
@@ -759,13 +997,22 @@ def build_visual_plan(
         "source_stem": stem,
         "clip_number": clip_number,
         "mode": ratio.mode,
+        "derived_visual_mode": derived_mode,
         "scene_plan_file": str(plan_path),
         "updated_candidate_file": str(_candidate_file_path(stem)) if update_candidates else "",
         "insert_count": ratio.insert_count,
         "summary": prompt_set.summary,
         "mood": prompt_set.mood,
+        "visual_ratio": ratio.model_dump(),
         "visual_plan": [beat.model_dump() for beat in plan],
         "prompts": [idea.model_dump() for idea in prompt_set.scene_prompts],
+        "plan_metadata": {
+            "plan_policy_version": SCENE_PLAN_POLICY_VERSION,
+            "transition_style": _RENDER_TRANSITION_TYPE,
+            "transition_duration_sec": _RENDER_TRANSITION_T,
+            "recommended_preset": _RECOMMENDED_PRESET,
+            "darkness_intent": _DARKNESS_INTENT,
+        },
     }
 
 
@@ -776,12 +1023,19 @@ def build_visual_plans_for_stem(
     only_add_broll: bool = True,
     overwrite: bool = True,
 ) -> dict:
+    """
+    Build scene plans for all matching clips in a stem.
+
+    Candidate JSON is written once per clip (sequential, not batched) because
+    each build_visual_plan call loads the latest on-disk state.  This is safe
+    for sequential execution and avoids accumulating stale in-memory state
+    across multiple planning calls.
+    """
     data = _load_candidates(stem)
     clips = data.get("clips") or []
     if not clips:
         return {"ok": False, "error": "No clip candidates found"}
 
-    results = []
     targets = []
     for idx, clip in enumerate(clips, start=1):
         if only_add_broll and not bool(clip.get("add_broll", False)):
@@ -796,6 +1050,7 @@ def build_visual_plans_for_stem(
             "results": [],
         }
 
+    results = []
     for clip_number in targets:
         try:
             results.append(
@@ -818,6 +1073,7 @@ def build_visual_plans_for_stem(
             "stem": stem,
             "mode": mode,
             "only_add_broll": only_add_broll,
+            "plan_policy_version": SCENE_PLAN_POLICY_VERSION,
             "results": results,
         },
         ensure_ascii=False,
