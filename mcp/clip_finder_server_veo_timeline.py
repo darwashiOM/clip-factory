@@ -780,11 +780,9 @@ def _scenic_prompt_for_slot(base_topic: str, slot: int) -> str:
 
 
 def _planned_insert_count(duration: float) -> int:
-    if duration < 28:
-        return 1
-    if duration < 44:
-        return 2
-    return 3
+    # New policy:
+    # one speaker intro, then one stock segment for the remainder
+    return 1
 
 
 def _build_visual_plan_for_clip(clip: ClipCandidate) -> List[VisualBeat]:
@@ -805,42 +803,11 @@ def _build_visual_plan_for_clip(clip: ClipCandidate) -> List[VisualBeat]:
             )
         ]
 
-    insert_count = _planned_insert_count(duration)
-    ai_len = 2.0 if insert_count <= 2 else 1.7
-    if duration > 45:
-        ai_len = 2.1 if insert_count == 2 else 1.8
+    # Speaker first, then stock for the rest
+    intro_sec = min(max(_SPEAKER_HOLD_SECS, 2.5), max(1.2, duration - 1.2))
 
-    # Use env-based guards so timing matches the renderer's SPEAKER_HOLD_SECS.
-    # intro_guard  = minimum speaker footage before the FIRST scenic insert.
-    # outro_guard  = minimum speaker footage held at the END of the clip.
-    intro_guard = _SPEAKER_HOLD_SECS
-    outro_guard = _OUTRO_GUARD_SECS
-    centers_map = {1: [0.52], 2: [0.38, 0.72], 3: [0.28, 0.55, 0.80]}
-    centers = centers_map.get(insert_count, [0.52])
-
-    ai_beats: List[VisualBeat] = []
-    last_end = max(0.0, intro_guard - 0.6)
-    latest_start = max(intro_guard, duration - outro_guard - ai_len)
-    for idx, frac in enumerate(centers, start=1):
-        desired_start = max(intro_guard, duration * frac - ai_len / 2.0)
-        start_offset = max(last_end + 0.8, desired_start)
-        start_offset = min(start_offset, latest_start)
-        end_offset = min(duration - outro_guard, start_offset + ai_len)
-        if end_offset - start_offset < 1.2:
-            continue
-        beat = VisualBeat(
-            type="stock_video",
-            start_offset_sec=round(start_offset, 2),
-            end_offset_sec=round(end_offset, 2),
-            duration_sec=round(end_offset - start_offset, 2),
-            asset_slot=idx,
-            prompt=_stock_query_for_clip(clip, idx),
-            notes=f"scenic_insert_{idx}",
-        )
-        ai_beats.append(beat)
-        last_end = end_offset
-
-    if not ai_beats:
+    # If the clip is too short, keep original only
+    if duration - intro_sec < 1.2:
         return [
             VisualBeat(
                 type="original",
@@ -849,43 +816,32 @@ def _build_visual_plan_for_clip(clip: ClipCandidate) -> List[VisualBeat]:
                 duration_sec=round(duration, 2),
                 asset_slot=0,
                 prompt="",
-                notes="fallback_original_only",
+                notes="too_short_for_stock_takeover",
             )
         ]
 
-    plan: List[VisualBeat] = []
-    cursor = 0.0
-    for beat in ai_beats:
-        if beat.start_offset_sec - cursor >= 0.35:
-            plan.append(
-                VisualBeat(
-                    type="original",
-                    start_offset_sec=round(cursor, 2),
-                    end_offset_sec=round(beat.start_offset_sec, 2),
-                    duration_sec=round(beat.start_offset_sec - cursor, 2),
-                    asset_slot=0,
-                    prompt="",
-                    notes="original_segment",
-                )
-            )
-        plan.append(beat)
-        cursor = beat.end_offset_sec
+    stock_prompt = _stock_query_for_clip(clip, 1)
 
-    if duration - cursor >= 0.35:
-        plan.append(
-            VisualBeat(
-                type="original",
-                start_offset_sec=round(cursor, 2),
-                end_offset_sec=round(duration, 2),
-                duration_sec=round(duration - cursor, 2),
-                asset_slot=0,
-                prompt="",
-                notes="original_outro",
-            )
-        )
-
-    return [p for p in plan if p.duration_sec > 0.2]
-
+    return [
+        VisualBeat(
+            type="original",
+            start_offset_sec=0.0,
+            end_offset_sec=round(intro_sec, 2),
+            duration_sec=round(intro_sec, 2),
+            asset_slot=0,
+            prompt="",
+            notes="speaker_intro",
+        ),
+        VisualBeat(
+            type="stock_video",
+            start_offset_sec=round(intro_sec, 2),
+            end_offset_sec=round(duration, 2),
+            duration_sec=round(duration - intro_sec, 2),
+            asset_slot=1,
+            prompt=stock_prompt,
+            notes="stock_takeover_full_remainder",
+        ),
+    ]
 
 def _normalize_plan(plan: ClipPlan, segments: List[dict], min_seconds: int, max_seconds: int) -> ClipPlan:
     cleaned: List[ClipCandidate] = []

@@ -363,6 +363,94 @@ def _search_stock(
 def _cache_key(provider: str, video_id: str) -> str:
     return f"{provider}__{video_id}"
 
+def _stock_manifest_path() -> Path:
+    return _stock_cache_dir() / "manifest.json"
+
+
+def _load_stock_manifest() -> dict:
+    p = _stock_manifest_path()
+    if not p.exists():
+        return {"version": 1, "videos": []}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "videos": []}
+
+
+def _save_stock_manifest(data: dict) -> None:
+    atomic_write_json(_stock_manifest_path(), data, ensure_ascii=False)
+
+
+def _normalize_cache_query(query: str) -> str:
+    return " ".join((query or "").strip().lower().split())
+
+
+def _register_cached_video(result: dict, cached_path: Path) -> None:
+    manifest = _load_stock_manifest()
+    videos = manifest.setdefault("videos", [])
+
+    provider = str(result.get("provider") or "")
+    video_id = str(result.get("id") or "")
+    local_path = str(cached_path)
+    normalized_query = _normalize_cache_query(str(result.get("query") or ""))
+
+    for item in videos:
+        if (
+            item.get("provider") == provider
+            and item.get("video_id") == video_id
+        ):
+            item.update({
+                "title": str(result.get("title") or ""),
+                "query": str(result.get("query") or ""),
+                "normalized_query": normalized_query,
+                "orientation": "portrait" if result.get("file_height", 0) >= result.get("file_width", 0) else "landscape",
+                "duration": result.get("duration", 0),
+                "width": result.get("file_width", result.get("width", 0)),
+                "height": result.get("file_height", result.get("height", 0)),
+                "download_url": str(result.get("download_url") or ""),
+                "source_page_url": str(result.get("source_page_url") or ""),
+                "local_path": local_path,
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            })
+            _save_stock_manifest(manifest)
+            return
+
+    videos.append({
+        "provider": provider,
+        "video_id": video_id,
+        "title": str(result.get("title") or ""),
+        "query": str(result.get("query") or ""),
+        "normalized_query": normalized_query,
+        "orientation": "portrait" if result.get("file_height", 0) >= result.get("file_width", 0) else "landscape",
+        "duration": result.get("duration", 0),
+        "width": result.get("file_width", result.get("width", 0)),
+        "height": result.get("file_height", result.get("height", 0)),
+        "download_url": str(result.get("download_url") or ""),
+        "source_page_url": str(result.get("source_page_url") or ""),
+        "local_path": local_path,
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _save_stock_manifest(manifest)
+
+
+def _find_reusable_cached_video(query: str, orientation: str = "portrait") -> Optional[Path]:
+    manifest = _load_stock_manifest()
+    normalized_query = _normalize_cache_query(query)
+
+    # exact query match first
+    for item in manifest.get("videos", []):
+        if item.get("normalized_query") != normalized_query:
+            continue
+        local_path = Path(str(item.get("local_path") or ""))
+        if not local_path.exists():
+            continue
+        if orientation and item.get("orientation") not in ("", orientation):
+            continue
+        return local_path
+
+    return None
+
+
 
 def _download_to_cache(result: dict) -> Path:
     """Download a video file to broll/stock/. Returns local cached path."""
@@ -395,6 +483,8 @@ def _download_to_cache(result: dict) -> Path:
     meta["local_path"] = str(out_path)
     meta["cached_at"] = datetime.now(timezone.utc).isoformat()
     atomic_write_json(out_path.with_suffix(".json"), meta, ensure_ascii=False)
+
+    _register_cached_video(result, out_path)
 
     return out_path
 
@@ -601,6 +691,29 @@ def fetch_stock_for_candidate(
         # Build a clean search query from the beat's prompt or notes
         raw_query = str(beat.get("prompt") or beat.get("notes") or "scenic nature landscape")
         query = _sanitize_query(raw_query)
+
+        reusable = _find_reusable_cached_video(query, orientation=orientation)
+        if reusable and reusable.exists():
+            pseudo_result = {
+                "provider": "cache",
+                "id": reusable.stem,
+                "title": query,
+                "duration": 0,
+                "query": query,
+                "download_url": "",
+                "source_page_url": "",
+            }
+            _link_to_clip(reusable, clip_path, pseudo_result)
+            fetched.append({
+                "asset_slot": slot,
+                "saved_file": str(clip_path),
+                "cached_source": str(reusable),
+                "provider": "cache",
+                "video_id": reusable.stem,
+                "query": query,
+                "status": "reused_from_manifest",
+            })
+            continue
 
         results, errors = _search_stock(query, per_page=5, orientation=orientation)
 

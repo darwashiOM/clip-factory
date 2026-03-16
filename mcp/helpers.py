@@ -114,6 +114,25 @@ def _srt_time_to_sec(time_str: str) -> float:
         return 0.0
 
 
+def _wrap_rtl_lines(text: str) -> str:
+    """
+    Force each ASS line to be treated as RTL text.
+
+    We wrap each visual line separately so bidi state does not cross \\N.
+    """
+    RLE = "\u202B"  # Right-to-Left Embedding
+    PDF = "\u202C"  # Pop Directional Formatting
+
+    parts = text.split(r"\N")
+    wrapped = []
+    for part in parts:
+        if part:
+            wrapped.append(f"{RLE}{part}{PDF}")
+        else:
+            wrapped.append(part)
+    return r"\N".join(wrapped)
+
+
 # ─── SRT parsing ──────────────────────────────────────────────────────────────
 
 def parse_srt_to_segments(srt_text: str) -> List[dict]:
@@ -152,22 +171,30 @@ def parse_srt_to_segments(srt_text: str) -> List[dict]:
 
 def _choose_balanced_break(words: List[str], max_words_per_line: int, max_lines: int) -> List[List[str]]:
     """
-    Split a word list into balanced lines for display.
+    Split a word list into balanced display lines with a TRUE hard cap.
 
-    Tries every legal break point and selects the most balanced split
-    (minimises the word-count difference between lines, with a small
-    preference for breaking after punctuation).
+    This function never returns more than:
+    - max_lines lines
+    - max_words_per_line words per line
 
-    If no two-line split is possible within the word limits, falls back to
-    chunking by max_words_per_line with soft punctuation preference.
+    Any additional words must be split into a later timed chunk upstream.
     """
     if not words:
         return []
+
+    max_words_per_line = max(1, int(max_words_per_line))
+    max_lines = max(1, int(max_lines))
+    visible_cap = max_words_per_line * max_lines
+
+    # Hard cap for a single visible event.
+    words = list(words[:visible_cap])
+
     if max_lines <= 1 or len(words) <= max_words_per_line:
         return [words]
 
+    # Best balanced legal split first.
     candidates = []
-    for break_idx in range(2, len(words)):
+    for break_idx in range(1, len(words)):
         left = words[:break_idx]
         right = words[break_idx:]
         if len(left) > max_words_per_line:
@@ -182,22 +209,15 @@ def _choose_balanced_break(words: List[str], max_words_per_line: int, max_lines:
         _, _, break_idx = min(candidates)
         return [words[:break_idx], words[break_idx:]]
 
-    # Fallback: chunk by max_words_per_line, preferring punctuation cut points.
-    #
-    # No-discard policy: silently dropping Quran canonical text is unacceptable.
-    # An extra line on screen is recoverable; missing words in a rendered verse
-    # are not.  effective_max equals exactly the lines needed to hold all words —
-    # no artificial ceiling.  max_lines is a soft visual target, not a word-count
-    # kill switch.  If the result overflows the visible area, the fix is to widen
-    # max_words_per_line via ASS_MAX_WORDS_PER_LINE, not to truncate text.
-    needed = (len(words) + max_words_per_line - 1) // max(1, max_words_per_line)
-    effective_max = max(max_lines, needed)
+    # Strict fallback: pack sequentially within the hard cap.
     lines: List[List[str]] = []
     idx = 0
-    while idx < len(words) and len(lines) < effective_max:
+    while idx < len(words) and len(lines) < max_lines:
         remaining = len(words) - idx
-        soft_max = min(max_words_per_line, remaining)
-        chunk = words[idx:idx + soft_max]
+        take = min(max_words_per_line, remaining)
+        chunk = words[idx:idx + take]
+
+        # Soft punctuation preference only inside the allowed chunk.
         best_cut = None
         for probe in range(len(chunk), max(1, len(chunk) - 2), -1):
             if chunk[probe - 1].endswith(("،", "؛", ":", ".", "؟", "!")):
@@ -205,11 +225,14 @@ def _choose_balanced_break(words: List[str], max_words_per_line: int, max_lines:
                 break
         if best_cut:
             chunk = chunk[:best_cut]
+
+        if not chunk:
+            chunk = words[idx:idx + take]
+
         lines.append(chunk)
         idx += len(chunk)
 
     return [line for line in lines if line]
-
 
 def split_caption_lines(
     text: str,
@@ -390,6 +413,20 @@ def _env_str_local(key: str, default: str) -> str:
     val = os.environ.get(key, "").strip()
     return val if val else default
 
+def _tokenize_text_words(
+    text: str,
+    *,
+    clean: bool,
+) -> List[str]:
+    if clean:
+        text = clean_arabic_for_captions(text)
+    if not text:
+        return []
+
+    text = _SENTENCE_BREAK_RE.sub(r"\1 ", text)
+    return [w for w in text.split() if w]
+
+
 
 def _split_words_into_lines(
     text: str,
@@ -445,6 +482,114 @@ def _allocate_word_windows(words: List[str], start_sec: float, end_sec: float) -
     return windows
 
 
+
+def _build_progressive_active_word_text(
+    words: List[str],
+    active_word_index: int,
+    *,
+    active_color: str,
+    active_outline: str,
+    active_shadow: str,
+    active_blur: float,
+    active_scale: float,
+) -> str:
+    """
+    Build progressive reveal text with explicit RTL word reversal.
+    
+    Uses Unicode Bidi Isolates to prevent the bidi algorithm from 
+    reordering across word boundaries.
+    """
+    # Unicode Bidi control characters
+    FSI = "\u2068"  # First Strong Isolate
+    PDI = "\u2069"  # Pop Directional Isolate
+    
+    scale_pct = int(round(active_scale * 100))
+    active_tag = (
+        rf"{{\1c{active_color}"
+        rf"\3c{active_outline}"
+        rf"\4c{active_shadow}"
+        rf"\blur{active_blur:.1f}"
+        rf"\fscx{scale_pct}\fscy{scale_pct}}}"
+    )
+    reset_tag = r"{\rDefault}"
+
+    visible_words = words[: active_word_index + 1]
+    visible_words_reversed = list(reversed(visible_words))
+
+    pieces: List[str] = []
+
+    for idx, word in enumerate(visible_words_reversed):
+        token = _escape_ass_text(word)
+
+        if idx > 0:
+            pieces.append(" ")
+
+        # Isolate each word to prevent bidi reordering
+        if idx == 0:  # Active word (newest, leftmost)
+            pieces.append(f"{FSI}{active_tag}{token}{reset_tag}{PDI}")
+        else:
+            pieces.append(f"{FSI}{token}{PDI}")
+
+    return "".join(pieces)
+
+
+def _chunk_words(words: List[str], chunk_size: int) -> List[List[str]]:
+    chunk_size = max(1, int(chunk_size))
+    return [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
+
+
+def _chunk_sequence_by_sizes(items, sizes: List[int]):
+    out = []
+    idx = 0
+    for size in sizes:
+        size = max(0, int(size))
+        if size <= 0:
+            continue
+        out.append(items[idx:idx + size])
+        idx += size
+    return out
+
+
+def _display_chunk_words(
+    words: List[str],
+    max_words_per_line: int,
+    max_lines: int,
+    preferred_chunk_words: int | None = None,
+) -> List[List[str]]:
+    """
+    Split a long word list into multiple display chunks.
+
+    Each chunk is guaranteed to fit in one visible event after line fitting.
+    """
+    if not words:
+        return []
+
+    max_words_per_line = max(1, int(max_words_per_line))
+    max_lines = max(1, int(max_lines))
+    visible_cap = max_words_per_line * max_lines
+
+    target = visible_cap if preferred_chunk_words is None else max(1, int(preferred_chunk_words))
+    target = min(target, visible_cap)
+
+    return [words[i:i + target] for i in range(0, len(words), target)]
+
+def _fit_chunk_into_lines(
+    words: List[str],
+    max_words_per_line: int,
+    max_lines: int,
+) -> List[List[str]]:
+    if not words:
+        return []
+
+    if max_lines <= 1 or len(words) <= max_words_per_line:
+        return [words]
+
+    return _choose_balanced_break(
+        words,
+        max_words_per_line=max_words_per_line,
+        max_lines=max_lines,
+    )
+
 def _build_inline_active_word_text(
     lines: List[List[str]],
     active_word_index: int,
@@ -456,15 +601,8 @@ def _build_inline_active_word_text(
     active_scale: float,
 ) -> str:
     """
-    Build one full highlighted sentence where only the active word is restyled.
-
-    Important:
-    - Timing order stays in logical transcript order.
-    - For highlighted ASS text only, we emit each Arabic line in reversed token
-      order because inline ASS override tags break libass bidi handling across
-      word runs.
-    - We DO NOT reverse timing or flat-word allocation. We only reverse the
-      visual emission order of tagged chunks.
+    Build highlighted Arabic text in normal logical order.
+    Do NOT reverse token order.
     """
     scale_pct = int(round(active_scale * 100))
     active_tag = (
@@ -480,28 +618,26 @@ def _build_inline_active_word_text(
     flat_idx = 0
 
     for line in lines:
-        indexed_words = []
-        for word in line:
-            indexed_words.append((flat_idx, word))
-            flat_idx += 1
-
         line_buf: List[str] = []
 
-        # Emit reversed so visually it stays RTL even with inline ASS tags
-        for visual_pos, (orig_idx, word) in enumerate(reversed(indexed_words)):
+        for pos, word in enumerate(line):
             token = _escape_ass_text(word)
 
-            if visual_pos > 0:
+            if pos > 0:
                 line_buf.append(" ")
 
-            if orig_idx == active_word_index:
+            if flat_idx == active_word_index:
                 line_buf.append(f"{active_tag}{token}{reset_tag}")
             else:
                 line_buf.append(token)
 
-        pieces.append("".join(line_buf))
+            flat_idx += 1
+
+        pieces.append(_wrap_rtl_lines("".join(line_buf)))
 
     return r"\N".join(pieces)
+
+
 
 
 def _build_static_lead_tag(cfg: "TextStyleConfig") -> str:
@@ -599,6 +735,17 @@ def generate_clip_ass(
 
     dialogue_lines: List[str] = []
 
+    hard_visible_words = max(1, config.max_words_per_line * config.max_lines)
+
+    highlight_chunk_words = min(
+        hard_visible_words,
+        max(1, _env_int_local("ASS_HIGHLIGHT_CHUNK_WORDS", hard_visible_words)),
+    )
+    highlight_gap_sec = max(0.0, _env_float_local("ASS_HIGHLIGHT_GAP_SEC", 0.03))
+
+    # Prevent visible overlap between consecutive dialogue events.
+    last_dialogue_end = 0.0
+
     for seg in segments:
         seg_start = float(seg.get("start", 0))
         seg_end = float(seg.get("end", 0))
@@ -620,74 +767,123 @@ def generate_clip_ass(
         if not text:
             continue
 
-        word_lines = _split_words_into_lines(
-            text,
-            max_words_per_line=config.max_words_per_line,
-            max_lines=config.max_lines,
-            clean=False,
-        )
-        if not word_lines:
+
+        logical_words = _tokenize_text_words(text, clean=False)
+        
+        if not logical_words:
             continue
 
-        display_word_lines = word_lines
+        word_windows = _segment_word_windows_from_transcript(
+            seg,
+            clip_start,
+            clip_end,
+            logical_words,
+        )
+        if not word_windows:
+            word_windows = _allocate_word_windows(logical_words, rel_start, rel_end)
 
-        if config.use_reshaper_bidi:
-            import arabic_reshaper
-            from bidi.algorithm import get_display
-            display_word_lines = [
-                [get_display(arabic_reshaper.reshape(word)) for word in line]
-                for line in word_lines
-            ]
+        if not word_windows:
+            continue
 
         if highlight_enabled:
-            flat_words = _flatten_word_lines(display_word_lines)
-            word_windows = _segment_word_windows_from_transcript(
-                seg,
-                clip_start,
-                clip_end,
-                flat_words,
+            chunk_groups = _chunk_words(logical_words, highlight_chunk_words)
+            window_groups = _chunk_sequence_by_sizes(
+                word_windows,
+                [len(chunk) for chunk in chunk_groups],
             )
 
-            if not word_windows:
-                word_windows = _allocate_word_windows(flat_words, rel_start, rel_end)
-                
-
-            for word_idx, (word_start, word_end) in enumerate(word_windows):
-                if word_end - word_start < 0.04:
+            for chunk_words, chunk_windows in zip(chunk_groups, window_groups):
+                if not chunk_words or not chunk_windows:
                     continue
 
-                line_text = _build_inline_active_word_text(
-                    display_word_lines,
-                    word_idx,
-                    active_color=active_color,
-                    active_outline=active_outline,
-                    active_shadow=active_shadow,
-                    active_blur=active_blur,
-                    active_scale=active_scale,
+                display_chunk_words = chunk_words
+                if config.use_reshaper_bidi:
+                    import arabic_reshaper
+                    from bidi.algorithm import get_display
+                    display_chunk_words = [
+                        get_display(arabic_reshaper.reshape(word))
+                        for word in chunk_words
+                    ]
+
+                for local_word_idx, (word_start, word_end) in enumerate(chunk_windows):
+                    if local_word_idx >= len(display_chunk_words):
+                        break
+
+                    if last_dialogue_end > 0:
+                        min_start = last_dialogue_end + highlight_gap_sec
+                    else:
+                        min_start = 0.0
+
+                    event_start = max(word_start, min_start)
+                    event_end = max(word_end, event_start + 0.04)
+
+                    line_text = _build_progressive_active_word_text(
+                        display_chunk_words,
+                        local_word_idx,
+                        active_color=active_color,
+                        active_outline=active_outline,
+                        active_shadow=active_shadow,
+                        active_blur=active_blur,
+                        active_scale=active_scale,
+                    )
+
+                    dialogue_lines.append(
+                        f"Dialogue: 0,"
+                        f"{sec_to_ass_time(event_start)},"
+                        f"{sec_to_ass_time(event_end)},"
+                        f"Default,,0,0,0,,{static_lead_tag}{line_text}"
+                    )
+
+                    last_dialogue_end = event_end
+
+        else:
+            chunk_groups = _display_chunk_words(
+                logical_words,
+                max_words_per_line=config.max_words_per_line,
+                max_lines=config.max_lines,
+                preferred_chunk_words=hard_visible_words,
+            )
+
+            window_groups = _chunk_sequence_by_sizes(
+                word_windows,
+                [len(chunk) for chunk in chunk_groups],
+            )
+
+            for chunk_words, chunk_windows in zip(chunk_groups, window_groups):
+                if not chunk_words or not chunk_windows:
+                    continue
+
+                display_chunk_words = chunk_words
+                if config.use_reshaper_bidi:
+                    import arabic_reshaper
+                    from bidi.algorithm import get_display
+                    display_chunk_words = [
+                        get_display(arabic_reshaper.reshape(word))
+                        for word in chunk_words
+                    ]
+
+                chunk_lines = _fit_chunk_into_lines(
+                    display_chunk_words,
+                    max_words_per_line=config.max_words_per_line,
+                    max_lines=config.max_lines,
                 )
+                line_text = r"\N".join(
+                    " ".join(line).strip() for line in chunk_lines if line
+                ).strip()
+                if not line_text:
+                    continue
+
+                event_start = max(chunk_windows[0][0], last_dialogue_end)
+                event_end = max(chunk_windows[-1][1], event_start + 0.04)
 
                 dialogue_lines.append(
                     f"Dialogue: 0,"
-                    f"{sec_to_ass_time(word_start)},"
-                    f"{sec_to_ass_time(word_end)},"
-                    f"Default,,0,0,0,,{static_lead_tag}{line_text}"
+                    f"{sec_to_ass_time(event_start)},"
+                    f"{sec_to_ass_time(event_end)},"
+                    f"Default,,0,0,0,,{static_lead_tag}{_wrap_rtl_lines(_escape_ass_text(line_text))}"
                 )
-        else:
-            line_text = r"\N".join(
-                " ".join(line).strip() for line in display_word_lines if line
-            )
 
-            line_text = _escape_ass_text(line_text)
-            if not line_text:
-                continue
-
-            dialogue_lines.append(
-                f"Dialogue: 0,"
-                f"{sec_to_ass_time(rel_start)},"
-                f"{sec_to_ass_time(rel_end)},"
-                f"Default,,0,0,0,,{lead_tag}{line_text}"
-            )
-
+                last_dialogue_end = event_end
     return header + "\n".join(dialogue_lines) + "\n"
 
 # ─── FFmpeg binary resolution ──────────────────────────────────────────────────

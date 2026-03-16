@@ -712,8 +712,6 @@ def _extract_boundary_suggestion(payload: Optional[dict]) -> Optional[dict]:
 def _resolve_clip_timing(stem: str, clip_number: int, clip: dict) -> Tuple[float, float, dict]:
     original_start = round(_safe_float(clip.get("start_sec")), 2)
     original_end = round(_safe_float(clip.get("end_sec")), 2)
-    source = "candidate_json"
-    reason = "original_candidate"
 
     override_start = clip.get("adjusted_start_sec")
     override_end = clip.get("adjusted_end_sec")
@@ -729,69 +727,99 @@ def _resolve_clip_timing(stem: str, clip_number: int, clip: dict) -> Tuple[float
                 "original_end_sec": original_end,
             }
 
-    clip_stem = f"{stem}__clip{clip_number:02d}"
-    summary_paths = [
-        TRANSCRIPTS / f"{clip_stem}.refined.summary.json",
-        TRANSCRIPTS / f"{clip_stem}.quran_guard.summary.json",
-    ]
+    use_boundary_suggestion = str(
+        os.environ.get("RENDER_USE_BOUNDARY_SUGGESTION", "false")
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
-    best_boundary = None
-    best_confidence = -1.0
-    for path in summary_paths:
-        payload = _load_json_if_exists(path)
-        boundary = _extract_boundary_suggestion(payload)
-        if not boundary:
-            continue
-        s = round(_safe_float(boundary.get("suggested_start_sec"), original_start), 2)
-        e = round(_safe_float(boundary.get("suggested_end_sec"), original_end), 2)
-        if e <= s:
-            continue
-        confidence = _safe_float(boundary.get("confidence"), 0.0)
-        if confidence > best_confidence:
-            best_confidence = confidence
-            best_boundary = {
-                "start": s,
-                "end": e,
-                "source": path.name,
-                "reason": boundary.get("reason", "boundary_suggestion"),
-                "confidence": round(confidence, 4),
-                "changed": bool(abs(s - original_start) > 0.01 or abs(e - original_end) > 0.01),
+    if use_boundary_suggestion:
+        clip_stem = f"{stem}__clip{clip_number:02d}"
+        summary_paths = [
+            TRANSCRIPTS / f"{clip_stem}.refined.summary.json",
+            TRANSCRIPTS / f"{clip_stem}.quran_guard.summary.json",
+        ]
+
+        best_boundary = None
+        best_confidence = -1.0
+        for path in summary_paths:
+            payload = _load_json_if_exists(path)
+            boundary = _extract_boundary_suggestion(payload)
+            if not boundary:
+                continue
+
+            s = round(_safe_float(boundary.get("suggested_start_sec"), original_start), 2)
+            e = round(_safe_float(boundary.get("suggested_end_sec"), original_end), 2)
+            if e <= s:
+                continue
+
+            confidence = _safe_float(boundary.get("confidence"), 0.0)
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_boundary = {
+                    "start": s,
+                    "end": e,
+                    "source": path.name,
+                    "reason": boundary.get("reason", "boundary_suggestion"),
+                    "confidence": round(confidence, 4),
+                    "changed": bool(abs(s - original_start) > 0.01 or abs(e - original_end) > 0.01),
+                }
+
+        if best_boundary:
+            return best_boundary["start"], best_boundary["end"], {
+                "source": best_boundary["source"],
+                "reason": best_boundary["reason"],
+                "confidence": best_boundary["confidence"],
+                "changed": best_boundary["changed"],
+                "original_start_sec": original_start,
+                "original_end_sec": original_end,
             }
 
-    if best_boundary:
-        return best_boundary["start"], best_boundary["end"], {
-            "source": best_boundary["source"],
-            "reason": best_boundary["reason"],
-            "confidence": best_boundary["confidence"],
-            "changed": best_boundary["changed"],
-            "original_start_sec": original_start,
-            "original_end_sec": original_end,
-        }
-
     return original_start, original_end, {
-        "source": source,
-        "reason": reason,
+        "source": "candidate_json",
+        "reason": "original_candidate",
         "changed": False,
         "original_start_sec": original_start,
         "original_end_sec": original_end,
     }
 
 
-def _middle_insert_plan(duration: float, ai_duration: float = 1.8) -> List[dict]:
-    # SPEAKER_HOLD_SECS: minimum speaker footage before the first scenic insert.
-    # Keeps the opening grounded in the reciter's presence before nature/scenic
-    # B-roll appears.  Configurable via .env (default 1.5 s).
-    hold = SPEAKER_HOLD_SECS
-    if duration <= ai_duration + 3.0:
-        return [{"type": "original", "start_offset_sec": 0.0, "end_offset_sec": round(duration, 2), "duration_sec": round(duration, 2), "asset_slot": 0, "prompt": "", "notes": "fallback_original_only"}]
-    start = max(hold, min(duration / 2.0 - ai_duration / 2.0, duration - ai_duration - hold))
-    end = min(duration - hold, start + ai_duration)
-    return [
-        {"type": "original", "start_offset_sec": 0.0, "end_offset_sec": round(start, 2), "duration_sec": round(start, 2), "asset_slot": 0, "prompt": "", "notes": "original_intro"},
-        {"type": "stock_video", "start_offset_sec": round(start, 2), "end_offset_sec": round(end, 2), "duration_sec": round(end - start, 2), "asset_slot": 1, "prompt": "", "notes": "manual_middle_insert"},
-        {"type": "original", "start_offset_sec": round(end, 2), "end_offset_sec": round(duration, 2), "duration_sec": round(duration - end, 2), "asset_slot": 0, "prompt": "", "notes": "original_outro"},
-    ]
 
+
+def _middle_insert_plan(duration: float) -> List[dict]:
+    intro_sec = min(max(SPEAKER_HOLD_SECS, 2.5), max(1.2, duration - 1.2))
+
+    if duration - intro_sec < 1.2:
+        return [
+            {
+                "type": "original",
+                "start_offset_sec": 0.0,
+                "end_offset_sec": round(duration, 2),
+                "duration_sec": round(duration, 2),
+                "asset_slot": 0,
+                "prompt": "",
+                "notes": "full_original_fallback",
+            }
+        ]
+
+    return [
+        {
+            "type": "original",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": round(intro_sec, 2),
+            "duration_sec": round(intro_sec, 2),
+            "asset_slot": 0,
+            "prompt": "",
+            "notes": "speaker_intro",
+        },
+        {
+            "type": "stock_video",
+            "start_offset_sec": round(intro_sec, 2),
+            "end_offset_sec": round(duration, 2),
+            "duration_sec": round(duration - intro_sec, 2),
+            "asset_slot": 1,
+            "prompt": "",
+            "notes": "stock_takeover_full_remainder",
+        },
+    ]
 
 def _normalize_visual_plan(plan: List[dict], duration: float) -> List[dict]:
     beats: List[dict] = []
@@ -855,6 +883,51 @@ def _build_video_segment_chain(input_label: str, trim_start: float, trim_end: fl
         f"{_preset_filter(preset)}"
         f"[{label}]"
     )
+
+def _safe_round3(value: float) -> float:
+    try:
+        return round(float(value), 3)
+    except Exception:
+        return 0.0
+
+
+def _visual_plan_total_duration(plan: List[dict]) -> float:
+    total = 0.0
+    for beat in plan or []:
+        total += max(0.0, _safe_float(beat.get("duration_sec"), 0.0))
+    return _safe_round3(total)
+
+
+def _visual_overlap_duration(
+    seg_durations: List[float],
+    transition_duration: float,
+) -> float:
+    if len(seg_durations) <= 1 or transition_duration <= 0.0:
+        return 0.0
+
+    overlap = 0.0
+    for i in range(1, len(seg_durations)):
+        prev_dur = seg_durations[i - 1] if i - 1 < len(seg_durations) else transition_duration
+        next_dur = seg_durations[i] if i < len(seg_durations) else transition_duration
+        safe_t = min(
+            transition_duration,
+            prev_dur * 0.5,
+            next_dur * 0.5,
+        )
+        safe_t = max(0.05, round(safe_t, 4))
+        overlap += safe_t
+    return _safe_round3(overlap)
+
+
+def _expected_visual_output_duration(
+    plan: List[dict],
+    transition_duration: float,
+) -> float:
+    seg_durations = [max(0.0, _safe_float(b.get("duration_sec"), 0.0)) for b in (plan or [])]
+    total = sum(seg_durations)
+    overlap = _visual_overlap_duration(seg_durations, transition_duration)
+    return _safe_round3(total - overlap)
+
 
 
 def _build_visual_timeline_filter(
@@ -1051,6 +1124,15 @@ def _render_one(
         transition_duration=RENDER_TRANSITION_DURATION,
     )
 
+    visual_plan_total = _visual_plan_total_duration(visual_plan)
+    visual_expected_output = _expected_visual_output_duration(
+        visual_plan,
+        RENDER_TRANSITION_DURATION,
+    )
+    visual_expected_overlap = _safe_round3(
+        visual_plan_total - visual_expected_output
+    )
+
     filter_parts = [visual_chain, audio_chain]
     if subtitle_filter_str:
         filter_parts.append(f"[vcat]{subtitle_filter_str}[v]")
@@ -1103,6 +1185,20 @@ def _render_one(
             "command": cmd,
             "timing": timing_meta,
             "visual_plan": visual_plan,
+            "timing_debug": {
+                "clip_start_sec": start,
+                "clip_end_sec": end,
+                "clip_duration_sec": duration,
+                "audio_trim_start_sec": start,
+                "audio_trim_end_sec": end,
+                "audio_expected_duration_sec": duration,
+                "visual_plan_total_duration_sec": visual_plan_total,
+                "visual_expected_output_duration_sec": visual_expected_output,
+                "visual_expected_overlap_loss_sec": visual_expected_overlap,
+                "transition_type": RENDER_TRANSITION_TYPE,
+                "transition_duration_sec": RENDER_TRANSITION_DURATION,
+                "segment_count": len(visual_plan),
+            },
         }
 
     effective_candidate = dict(clip)
@@ -1132,6 +1228,20 @@ def _render_one(
         "timing": timing_meta,
         "visual_plan": visual_plan,
         "used_assets": used_assets,
+        "timing_debug": {
+            "clip_start_sec": start,
+            "clip_end_sec": end,
+            "clip_duration_sec": duration,
+            "audio_trim_start_sec": start,
+            "audio_trim_end_sec": end,
+            "audio_expected_duration_sec": duration,
+            "visual_plan_total_duration_sec": visual_plan_total,
+            "visual_expected_output_duration_sec": visual_expected_output,
+            "visual_expected_overlap_loss_sec": visual_expected_overlap,
+            "transition_type": RENDER_TRANSITION_TYPE,
+            "transition_duration_sec": RENDER_TRANSITION_DURATION,
+            "segment_count": len(visual_plan),
+        },
     }
 
 
