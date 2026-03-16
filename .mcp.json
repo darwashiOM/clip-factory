@@ -1,0 +1,144 @@
+{
+  "mcpServers": {
+    "renderer": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/renderer_server_veo_timeline.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "clip-ops": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/ops_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "transcribe": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/transcribe_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "quran-guard": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/quran_guard_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "clip-finder": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/clip_finder_server_veo_timeline.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "transcript-refiner": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/transcript_refiner_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "stock-fetcher": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/stock_fetcher_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "scene-director": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/scene_director_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "look-lab": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/look_lab_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "asset-guard": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/asset_guard_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "video-pool": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/video_pool_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "publisher": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/publisher_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "scheduler": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/scheduler_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    },
+    "tiktok-uploader": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "/Users/darwashi/clip-factory/mcp/tiktok_publisher_server.py"
+      ],
+      "env": {
+        "CLIP_FACTORY_ROOT": "/Users/darwashi/clip-factory"
+      }
+    }
+  }
+}
