@@ -1,0 +1,46 @@
+
+# dependencies
+node_modules/
+**/node_modules/
+
+# python envs / caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# git / editor / system
+.git/
+.DS_Store
+
+# build / generated
+dist/
+build/
+coverage/
+.next/
+out/
+tmp/
+temp/
+
+# large project artifacts you do NOT want shaping the README
+transcripts/
+clips/
+broll/
+pool/
+accounts/
+
+# remotion generated or bundled stuff
+remotion/node_modules/
+remotion/dist/
+remotion/build/
+
+# media outputs
+*.mp3
+*.mp4
+*.wav
+*.srt
+
+# noisy generated data
+ts_dump.txt
+currentPROMPT.txt
+tiktok_accounts.json

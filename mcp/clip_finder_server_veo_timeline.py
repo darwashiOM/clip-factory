@@ -721,55 +721,32 @@ def _heavy_overlap_ratio(a: ClipCandidate, b: ClipCandidate) -> float:
     return overlap / shorter
 
 
+_NATURE_ONLY_QUERIES = [
+    "misty mountain landscape",
+    "ocean waves shoreline",
+    "forest river sunlight",
+    "desert dunes sunset",
+    "clouds over valley",
+    "waterfall in forest",
+    "calm lake mountains",
+    "rain on leaves",
+]
+
 def _sanitize_visual_topic(raw: str) -> str:
-    text = re.sub(r"\s+", " ", str(raw or "").strip())
-    text = text.replace("_", " ").replace("-", " ")
-    lowered = text.lower()
-
-    if any(token in lowered for token in ["dua", "دعاء", "prayer", "salah", "salat", "خشوع", "tawbah", "repent", "quran", "قرآن", "mushaf", "mosque", "masjid", "مسجد"]):
-        return "empty mosque interior with warm dawn light and floating dust motes"
-    if any(token in lowered for token in ["جنة", "jannah", "paradise", "garden", "رحمة", "mercy"]):
-        return "lush garden with flowing water at sunrise"
-    if any(token in lowered for token in ["نار", "hell", "warning", "punishment", "fear", "storm"]):
-        return "dramatic storm clouds over a barren desert landscape"
-    if any(token in lowered for token in ["صبر", "sabr", "patience", "trust", "tawakkul", "journey", "path"]):
-        return "vast desert dunes at sunrise with gentle wind"
-    if any(token in lowered for token in ["tears", "cry", "repentance", "توبة", "night"]):
-        return "rain on a window at night with soft city lights blurred in the distance"
-
-    cleaned = re.sub(r"[^\w\s\u0600-\u06FF]", " ", text).strip()
-    return cleaned or "serene natural landscape with soft cinematic motion"
+    # Ignore the speech topic entirely.
+    # We want nature-only visuals no matter what the scholar is saying.
+    text = str(raw or "").strip()
+    if not text:
+        return _NATURE_ONLY_QUERIES[0]
+    return _NATURE_ONLY_QUERIES[0]
 
 
 def _stock_query_for_clip(clip: "ClipCandidate", slot: int) -> str:
     """
-    Return a short, search-friendly query for a stock footage provider.
-
-    Uses broll_query first (set by the Gemini clip finder); falls back to title.
-    Arabic text is replaced with a themed scenic fallback via _sanitize_visual_topic.
-    Slot is used to slightly diversify multi-slot queries (title vs broll_query).
+    Force nature-only stock queries.
+    Do not use clip meaning, title, hook, or broll_query to theme the visuals.
     """
-    _FALLBACK_QUERIES = [
-        "scenic nature landscape",
-        "misty mountains dawn",
-        "ocean waves shore",
-        "desert dunes sunset",
-        "river forest mist",
-    ]
-    if slot == 1 or not clip.title:
-        base = (clip.broll_query or clip.title or "").strip()
-    else:
-        # Second/third slot: prefer title for variety
-        base = (clip.title or clip.broll_query or "").strip()
-
-    # Strip clips that are fully Arabic — use themed mapping instead
-    if not base or all(ord(c) > 0x06FF or c.isspace() for c in base):
-        return _FALLBACK_QUERIES[(slot - 1) % len(_FALLBACK_QUERIES)]
-
-    # Run through the themed mapper so Quran/Islamic keywords map to good visuals
-    query = _sanitize_visual_topic(base)
-    # Keep it concise: stock search works better with shorter, focused phrases
-    return query[:80].strip()
+    return _NATURE_ONLY_QUERIES[(max(1, slot) - 1) % len(_NATURE_ONLY_QUERIES)]
 
 
 # Keep old name as alias so any external code that references it still works.

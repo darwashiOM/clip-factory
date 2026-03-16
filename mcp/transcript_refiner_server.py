@@ -6,6 +6,7 @@ and now also emits a boundary suggestion for cleaner render timing.
 """
 
 from pathlib import Path
+import re
 import sys
 import os
 import json
@@ -36,6 +37,40 @@ CLIPS = ROOT / "clips"
 
 mcp = FastMCP("clip-factory-transcript-refiner", json_response=True)
 
+_PUNCT_END_RE = re.compile(r"[.؟!?!۔…:؛،]$")
+
+_QUESTION_START_WORDS = {
+    "هل", "أ", "أليس", "ألم", "كيف", "لماذا", "متى", "أين", "من", "ماذا", "ما", "أي", "كم",
+}
+
+
+def _ensure_terminal_punctuation(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return text
+
+    if _PUNCT_END_RE.search(text):
+        return text
+
+    words = [w.strip("،؛:.?!؟") for w in text.split() if w.strip("،؛:.?!؟")]
+    if not words:
+        return text
+
+    first = words[0]
+    last = words[-1]
+
+    if first in _QUESTION_START_WORDS or text.startswith("هل "):
+        return text + "؟"
+
+    if last in _CONTINUATION_END_WORDS:
+        return text + "،"
+
+    if len(words) <= 3:
+        return text + "،"
+
+    return text + "."
+
+
 _CONTINUATION_START_WORDS = {
     "و", "ف", "ثم", "لكن", "لأن", "لان", "إذا", "اذا", "يعني", "ولهذا", "ولذلك", "أما", "اما", "بل", "كما",
 }
@@ -63,6 +98,33 @@ def _model_name() -> str:
     if legacy:
         return legacy
     return llm_client._text_model_name()
+
+
+def _ensure_terminal_punctuation(text: str) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return text
+
+    if _PUNCT_END_RE.search(text):
+        return text
+
+    words = [w.strip("،؛:.?!؟") for w in text.split() if w.strip("،؛:.?!؟")]
+    if not words:
+        return text
+
+    first = words[0]
+    last = words[-1]
+
+    if first in _QUESTION_START_WORDS or text.startswith("هل "):
+        return text + "؟"
+
+    if last in _CONTINUATION_END_WORDS:
+        return text + "،"
+
+    if len(words) <= 3:
+        return text + "،"
+
+    return text + "."
 
 
 def _load_verbose(stem: str):
@@ -174,17 +236,17 @@ Do not include commentary.
 NON-NEGOTIABLE RULES:
 - Keep the SAME number of segments.
 - Keep each segment aligned 1-to-1 with its LOCAL chunk index.
-- Correct Arabic spelling, obvious ASR mistakes, spacing, and punctuation.
+- Correct Arabic spelling, obvious ASR mistakes, spacing, punctuation, and full Arabic diacritization.
+- Every segment must end with suitable punctuation.
+- Add natural full tashkil to all Arabic text whenever you can do so confidently.
 - Do not summarize.
 - Do not merge segments.
 - Do not split segments.
-- Do not add any text that is not supported by the original segment.
+- Do not add unsupported new meaning.
 - Preserve meaning as closely as possible.
 - Keep Islamic terminology natural in Arabic.
-- If a phrase might be Quran and you are not absolutely sure, stay very close to the original wording instead of guessing.
-- If a segment is already good, keep it nearly unchanged.
-- Preserve Arabic diacritics and Quranic marks when they already exist in the source text.
-- If the source text has no diacritics, do not add them unless the segment is an exact Quran match from a trusted Quran source.
+- If a phrase is clearly Quran, use the exact correct Quran wording.
+- If a phrase might be Quran but you are not sure, do not guess Quran text.
 
 Output one corrected text entry for every local index shown below.
 
@@ -194,7 +256,14 @@ Segments:
 
 
 def _coerce_refine_response(response_text: str, chunk: List[dict]) -> List[str]:
-    parsed = SegmentRefineResult.model_validate_json(response_text)
+    text = str(response_text or "").strip()
+
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
+    parsed = SegmentRefineResult.model_validate_json(text)
     corrected_by_local = {item.index: item.text.strip() for item in parsed.corrected_segments}
 
     results = []
@@ -202,16 +271,21 @@ def _coerce_refine_response(response_text: str, chunk: List[dict]) -> List[str]:
         original = item["text"].strip()
         corrected = corrected_by_local.get(item["local_index"], original).strip() or original
         results.append(corrected)
+
+    if len(results) != len(chunk):
+        raise ValueError("Refiner returned wrong segment count")
+
     return results
 
-
-def _refine_chunk(chunk: List[dict], retries: int = 1, retry_sleep_sec: float = 1.0) -> List[str]:
-    """Call the configured LLM to correct a chunk of transcript segments.
-    When TRANSCRIPT_REFINER_USE_LLM=false, returns originals unchanged (no API call)."""
+def _refine_chunk(
+    chunk: List[dict],
+    retries: int = 4,
+    retry_sleep_sec: float = 1.5,
+) -> tuple[List[str], bool]:
     originals = [item["text"].strip() for item in chunk]
 
     if not llm_client.transcript_refiner_use_llm():
-        return originals
+        return originals, False
 
     prompt = _build_chunk_prompt(chunk)
     llm = llm_client.get_text_llm()
@@ -219,13 +293,13 @@ def _refine_chunk(chunk: List[dict], retries: int = 1, retry_sleep_sec: float = 
     for attempt in range(retries + 1):
         try:
             raw = llm.generate_json(prompt)
-            return _coerce_refine_response(raw, chunk)
+            corrected = _coerce_refine_response(raw, chunk)
+            return corrected, True
         except Exception:
             if attempt < retries:
-                time.sleep(retry_sleep_sec)
+                time.sleep(retry_sleep_sec * (attempt + 1))
 
-    return originals
-
+    return originals, False
 
 def _text(seg: dict) -> str:
     return str(seg.get("text", "")).strip().replace("\n", " ")
@@ -469,8 +543,8 @@ def refine_clip_candidate(
     clip_number: int,
     overwrite: bool = True,
     padding_segments: int = 1,
-    chunk_size: int = 12,
-    max_chars: int = 1800,
+    chunk_size: int = 6,
+    max_chars: int = 900,
 ) -> dict:
     """
     Refine only the transcript text needed for one selected clip candidate.
@@ -501,8 +575,8 @@ def refine_clip_candidate(
 
     for chunk in chunks:
         originals = [item["text"].strip() for item in chunk]
-        refined_texts = _refine_chunk(chunk)
-        if refined_texts == originals:
+        refined_texts, ok = _refine_chunk(chunk)
+        if not ok:
             failed_chunks += 1
 
         for item, refined_text in zip(chunk, refined_texts):

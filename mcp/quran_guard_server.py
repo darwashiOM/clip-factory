@@ -11,6 +11,7 @@ from typing import Optional, List, Tuple, Dict, Set, Any
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+import llm_client
 
 # Two-phase bootstrap — see renderer_server_veo_timeline.py for full explanation.
 _INITIAL_ROOT = Path(
@@ -83,9 +84,81 @@ for _w in _RAW_STOPWORDS:
 def clean_render_arabic_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", str(text or ""))
     text = text.replace("ـ", "")
-    text = strip_tashkeel(text)
+    # Preserve tashkil for display/render text.
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+_ARABIC_LETTER_RE = re.compile(r"[\u0621-\u064A\u066E-\u066F\u0671-\u06D3\u06FA-\u06FC]")
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    val = os.environ.get(key, "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "on")
+
+
+def _token_count(text: str) -> int:
+    return len([w for w in str(text or "").split() if w])
+
+
+@lru_cache(maxsize=4096)
+def _diacritize_non_quran_text(text: str) -> str:
+    """
+    Add tashkil to non-Quran Arabic for display only.
+
+    Safety rules:
+    - Never paraphrase
+    - Never add/remove words
+    - If backend fails, return the original cleaned text
+    - If token count changes, return the original cleaned text
+    """
+    source = clean_render_arabic_text(text)
+    if not source:
+        return source
+
+    if not _env_bool("ARABIC_DIACRITIZE_NON_QURAN", True):
+        return source
+
+    if not _ARABIC_LETTER_RE.search(source):
+        return source
+
+    system = (
+        "You are a precise Arabic diacritizer. "
+        "Add Arabic tashkil to the exact same text. "
+        "Do not paraphrase. Do not summarize. Do not explain. "
+        "Do not add or remove words. Keep punctuation and word order exactly. "
+        "Return JSON only with one key named text."
+    )
+
+    prompt = (
+        "Diacritize the following Arabic text.\n"
+        "Rules:\n"
+        "- Preserve the exact same words and order.\n"
+        "- Preserve the exact same whitespace-separated token count.\n"
+        "- Keep non-Arabic tokens unchanged.\n"
+        "- If you are uncertain about a token, keep that token unchanged.\n\n"
+        f'Text: "{source}"'
+    )
+
+    try:
+        llm = llm_client.get_text_llm()
+        raw = llm.generate_json(prompt, system=system)
+        data = json.loads(raw)
+        out = clean_render_arabic_text(data.get("text", ""))
+
+        if not out:
+            return source
+
+        if _token_count(out) != _token_count(source):
+            return source
+
+        return out
+    except Exception:
+        if _env_bool("ARABIC_DIACRITIZE_FAIL_OPEN", True):
+            return source
+        raise
 
 
 def _tokenize_norm(text: str) -> List[str]:
@@ -337,6 +410,53 @@ def _bigram_overlap(source_bigrams_set: Set[Tuple[str, str]], candidate_bigrams_
     inter = len(source_bigrams_set & candidate_bigrams_set)
     return inter / max(1, len(source_bigrams_set))
 
+def _safe_sync_segment_words_to_render_text(seg: dict, render_text: str) -> tuple[dict, bool]:
+    """
+    Safely rewrite seg["words"][i]["word"] to match render_text, but ONLY when
+    the corrected text can be mapped 1-to-1 onto the existing timed words.
+
+    Returns:
+        (updated_segment, synced_ok)
+
+    Safety rule:
+    - If there is any mismatch in non-empty word count, do nothing to seg["words"].
+    - We still update seg["text"] so the pipeline keeps working as before.
+    """
+    seg_out = dict(seg)
+    render_text = str(render_text or "").replace("\n", " ").strip()
+    seg_out["text"] = render_text
+
+    raw_words = list(seg_out.get("words") or [])
+    if not render_text or not raw_words:
+        return seg_out, False
+
+    corrected_tokens = [w for w in render_text.split() if w]
+    if not corrected_tokens:
+        return seg_out, False
+
+    nonempty_positions = []
+    for idx, item in enumerate(raw_words):
+        token = str((item or {}).get("word", "")).strip()
+        if token:
+            nonempty_positions.append(idx)
+
+    if len(corrected_tokens) != len(nonempty_positions):
+        return seg_out, False
+
+    new_words = []
+    cursor = 0
+    nonempty_pos_set = set(nonempty_positions)
+
+    for idx, item in enumerate(raw_words):
+        item_copy = dict(item or {})
+        if idx in nonempty_pos_set:
+            item_copy["word"] = corrected_tokens[cursor]
+            cursor += 1
+        new_words.append(item_copy)
+
+    seg_out["words"] = new_words
+    return seg_out, True
+
 
 def _score_candidate_tokens(source_features: dict, candidate_tokens: List[str]) -> Tuple[float, dict]:
     corpus = _load_corpus()
@@ -555,10 +675,11 @@ def _best_verse_match_cached(source_norm: str) -> Tuple[Optional[int], float, fl
             continue
 
         fragment_meta = dict(fragment_meta)
-        fragment_meta["fragment_strict_threshold"] = 0.94
+        fragment_meta["fragment_strict_threshold"] = 0.60
 
-        # Fragment replacement is intentionally stricter than full-verse replacement.
-        if fragment_score < 0.94:
+        # Fragment replacement is intentionally stricter than full-verse replacement,
+        # but no longer hard-locked near 0.94.
+        if fragment_score < 0.60:
             continue
         if fragment_meta.get("matched_anchor_tokens", 0) < 3:
             continue
@@ -635,18 +756,18 @@ def _is_acceptable_match(
     bigram_overlap = float(meta.get("bigram_overlap", 0.0))
 
     if match_mode == "fragment":
-        if best_score < max(0.94, min_confidence + 0.01):
+        if best_score < max(0.60, min_confidence):
             return False
-        if matched_anchor_tokens < 3:
+        if matched_anchor_tokens < 2:
             return False
-        if weighted_overlap < 0.72:
+        if weighted_overlap < 0.58:
             return False
-        if bigram_overlap < 0.34 and matched_anchor_tokens < 4:
+        if bigram_overlap < 0.22 and matched_anchor_tokens < 3:
             return False
     else:
-        if matched_anchor_tokens == 0 and weighted_overlap < 0.60:
+        if matched_anchor_tokens == 0 and weighted_overlap < 0.52:
             return False
-        if matched_anchor_tokens < 2 and weighted_overlap < 0.68:
+        if matched_anchor_tokens < 2 and weighted_overlap < 0.60:
             return False
 
     return True
@@ -790,6 +911,14 @@ def _guard_segments(
                 if idx_in_window == 0 and win["window_size"] > 1:
                     seg_copy["end"] = window_end
 
+                display_text = render_text if idx_in_window == 0 else ""
+
+                if idx_in_window == 0 and display_text:
+                    seg_copy, timed_words_synced = _safe_sync_segment_words_to_render_text(seg_copy, display_text)
+                else:
+                    seg_copy["text"] = ""
+                    timed_words_synced = False
+
                 seg_copy["quran_guard"] = {
                     "is_quran_match": True,
                     "verse_key": verse.get("verse_key", ""),
@@ -797,16 +926,13 @@ def _guard_segments(
                     "canonical_render_text": render_text,
                     "canonical_uthmani_text": canonical_uthmani,
                     "absorbed_into_previous_window_segment": idx_in_window > 0,
-                    "render_text": render_text if idx_in_window == 0 else "",
-                    # window_start / window_end are stored for debugging and
-                    # to allow downstream tools to reconstruct full cue timing
-                    # without re-reading the SRT.
+                    "render_text": display_text,
                     "window_start": window_start,
                     "window_end": window_end,
                     "match_mode": win["match_mode"],
                     "matched_span": matched_span,
+                    "timed_words_synced": timed_words_synced,
                 }
-                seg_copy["text"] = render_text if idx_in_window == 0 else ""
                 augmented_segments.append(seg_copy)
 
             i += win["window_size"]
@@ -814,13 +940,16 @@ def _guard_segments(
 
         seg = dict(segments[i])
         raw_text = str(seg.get("text", "")).strip()
-        render_text = clean_render_arabic_text(raw_text)
+        render_text = _diacritize_non_quran_text(raw_text)
+
+        seg, timed_words_synced = _safe_sync_segment_words_to_render_text(seg, render_text)
 
         seg["quran_guard"] = {
             "is_quran_match": False,
             "render_text": render_text,
+            "timed_words_synced": timed_words_synced,
+            "render_source": "diacritized_non_quran",
         }
-        seg["text"] = render_text
         augmented_segments.append(seg)
 
         if render_text:
@@ -870,7 +999,7 @@ def list_quran_guard_sources(limit: int = 50) -> dict:
 
 
 @mcp.tool()
-def match_text_against_quran(text: str, render_script: str = "simple") -> dict:
+def match_text_against_quran(text: str, render_script: str = "uthmani") -> dict:
     if render_script not in {"simple", "uthmani"}:
         raise ValueError("render_script must be 'simple' or 'uthmani'")
 
@@ -904,10 +1033,10 @@ def match_text_against_quran(text: str, render_script: str = "simple") -> dict:
 @mcp.tool()
 def fix_quran_in_transcript(
     stem: str,
-    min_confidence: float = 0.92,
-    min_margin_over_second: float = 0.04,
-    min_words: int = 5,
-    render_script: str = "simple",
+    min_confidence: float = 0.60,
+    min_margin_over_second: float = 0.02,
+    min_words: int = 4,
+    render_script: str = "uthmani",
     max_window_segments: int = 3,
 ) -> dict:
     """
@@ -994,10 +1123,10 @@ def fix_quran_in_transcript(
 def fix_quran_in_clip_candidate(
     stem: str,
     clip_number: int,
-    min_confidence: float = 0.92,
-    min_margin_over_second: float = 0.04,
-    min_words: int = 5,
-    render_script: str = "simple",
+    min_confidence: float = 0.60,
+    min_margin_over_second: float = 0.02,
+    min_words: int = 4,
+    render_script: str = "uthmani",
     max_window_segments: int = 3,
 ) -> dict:
     """

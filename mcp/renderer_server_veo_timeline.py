@@ -104,7 +104,7 @@ ADAPTIVE_TEXT_COLOR: bool = (
 # Optional path to a directory containing font files for the libass subtitles
 # filter.  When set, added as `fontsdir=...` to the ffmpeg subtitles filter so
 # libass looks there BEFORE the system fontconfig path.
-# Example: ASS_FONTSDIR=/Users/you/clip-factory/fonts
+# Example: ASS_FONTSDIR=/Users/darwashi/clip-factory/fonts
 # Leave unset to rely on fontconfig alone (works on macOS with system fonts).
 ASS_FONTSDIR: str = os.environ.get("ASS_FONTSDIR", "").strip()
 
@@ -971,19 +971,46 @@ def _build_visual_timeline_filter(
             seg_parts.append(_build_video_segment_chain("[0:v]", trim_start, trim_end, preset, label))
         else:
             slot = int(beat.get("asset_slot") or 0)
+
             if slot < 1 or slot not in ai_input_index_map:
-                # Missing asset — fall back to original footage for this window.
                 label = f"vfallback{idx}"
-                if audio_only:
-                    trim_start, trim_end = seg_start, seg_end
+
+                if ai_input_index_map:
+                    # Never fall back to black/original when we have at least one real scenic asset.
+                    fallback_slot = sorted(ai_input_index_map.keys())[0]
+                    input_idx = ai_input_index_map[fallback_slot]
+                    used_assets.append(f"fallback_slot:{fallback_slot}@input:{input_idx}")
+                    seg_parts.append(
+                        _build_video_segment_chain(
+                            f"[{input_idx}:v]",
+                            0.0,
+                            seg_dur,
+                            preset,
+                            label,
+                        )
+                    )
                 else:
-                    trim_start, trim_end = start + seg_start, start + seg_end
-                seg_parts.append(_build_video_segment_chain("[0:v]", trim_start, trim_end, preset, label))
+                    # If there is truly no scenic asset at all, only then use original footage.
+                    # This avoids black gaps caused by partially missing stock windows.
+                    if audio_only:
+                        trim_start, trim_end = seg_start, seg_end
+                    else:
+                        trim_start, trim_end = start + seg_start, start + seg_end
+                    seg_parts.append(
+                        _build_video_segment_chain("[0:v]", trim_start, trim_end, preset, label)
+                    )
             else:
                 input_idx = ai_input_index_map[slot]
                 used_assets.append(f"slot:{slot}@input:{input_idx}")
-                seg_parts.append(_build_video_segment_chain(f"[{input_idx}:v]", 0.0, beat["duration_sec"], preset, label))
-
+                seg_parts.append(
+                    _build_video_segment_chain(
+                        f"[{input_idx}:v]",
+                        0.0,
+                        beat["duration_sec"],
+                        preset,
+                        label,
+                    )
+                )
         seg_labels.append(label)
         seg_durations.append(seg_dur)
 

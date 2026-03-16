@@ -655,6 +655,38 @@ def _build_static_lead_tag(cfg: "TextStyleConfig") -> str:
 
     return base + "}"
 
+def _segment_exact_word_items_from_transcript(
+    seg: dict,
+    clip_start: float,
+    clip_end: float,
+) -> List[dict]:
+    raw_words = seg.get("words") or []
+    usable = []
+
+    for item in raw_words:
+        try:
+            w_start = float(item.get("start", 0.0))
+            w_end = float(item.get("end", w_start))
+        except (TypeError, ValueError):
+            continue
+
+        token = str(item.get("word", "")).strip()
+        if not token:
+            continue
+
+        if w_end <= clip_start or w_start >= clip_end:
+            continue
+
+        usable.append(
+            {
+                "word": token,
+                "start": round(max(w_start, clip_start) - clip_start, 3),
+                "end": round(min(w_end, clip_end) - clip_start, 3),
+            }
+        )
+
+    return usable
+
 def _segment_word_windows_from_transcript(
     seg: dict,
     clip_start: float,
@@ -761,7 +793,12 @@ def generate_clip_ass(
         raw_text = segment_render_text(seg)
         text = raw_text.replace("\n", " ").strip()
 
-        if do_clean:
+        qg = seg.get("quran_guard") or {}
+        has_guard_render_text = bool(str(qg.get("render_text", "")).strip())
+
+        # Do NOT strip tashkil from quran_guard display text.
+        # That text is already the final render/display layer.
+        if do_clean and not has_guard_render_text:
             text = clean_arabic_for_captions(text)
 
         if not text:
@@ -769,7 +806,7 @@ def generate_clip_ass(
 
 
         logical_words = _tokenize_text_words(text, clean=False)
-        
+
         if not logical_words:
             continue
 
@@ -786,7 +823,27 @@ def generate_clip_ass(
             continue
 
         if highlight_enabled:
-            chunk_groups = _chunk_words(logical_words, highlight_chunk_words)
+            exact_word_items = _segment_exact_word_items_from_transcript(
+                seg,
+                clip_start,
+                clip_end,
+            )
+
+            if exact_word_items:
+                flat_words = [item["word"] for item in exact_word_items]
+                word_windows = [(item["start"], item["end"]) for item in exact_word_items]
+            else:
+                # Fallback only when word-level transcript data is missing
+                logical_words = [w for w in text.split() if w]
+                if not logical_words:
+                    continue
+                flat_words = logical_words
+                word_windows = _allocate_word_windows(flat_words, rel_start, rel_end)
+
+            if not flat_words or not word_windows:
+                continue
+
+            chunk_groups = _chunk_words(flat_words, highlight_chunk_words)
             window_groups = _chunk_sequence_by_sizes(
                 word_windows,
                 [len(chunk) for chunk in chunk_groups],
@@ -836,54 +893,8 @@ def generate_clip_ass(
 
                     last_dialogue_end = event_end
 
-        else:
-            chunk_groups = _display_chunk_words(
-                logical_words,
-                max_words_per_line=config.max_words_per_line,
-                max_lines=config.max_lines,
-                preferred_chunk_words=hard_visible_words,
-            )
 
-            window_groups = _chunk_sequence_by_sizes(
-                word_windows,
-                [len(chunk) for chunk in chunk_groups],
-            )
 
-            for chunk_words, chunk_windows in zip(chunk_groups, window_groups):
-                if not chunk_words or not chunk_windows:
-                    continue
-
-                display_chunk_words = chunk_words
-                if config.use_reshaper_bidi:
-                    import arabic_reshaper
-                    from bidi.algorithm import get_display
-                    display_chunk_words = [
-                        get_display(arabic_reshaper.reshape(word))
-                        for word in chunk_words
-                    ]
-
-                chunk_lines = _fit_chunk_into_lines(
-                    display_chunk_words,
-                    max_words_per_line=config.max_words_per_line,
-                    max_lines=config.max_lines,
-                )
-                line_text = r"\N".join(
-                    " ".join(line).strip() for line in chunk_lines if line
-                ).strip()
-                if not line_text:
-                    continue
-
-                event_start = max(chunk_windows[0][0], last_dialogue_end)
-                event_end = max(chunk_windows[-1][1], event_start + 0.04)
-
-                dialogue_lines.append(
-                    f"Dialogue: 0,"
-                    f"{sec_to_ass_time(event_start)},"
-                    f"{sec_to_ass_time(event_end)},"
-                    f"Default,,0,0,0,,{static_lead_tag}{_wrap_rtl_lines(_escape_ass_text(line_text))}"
-                )
-
-                last_dialogue_end = event_end
     return header + "\n".join(dialogue_lines) + "\n"
 
 # ─── FFmpeg binary resolution ──────────────────────────────────────────────────
