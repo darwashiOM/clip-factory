@@ -4,7 +4,7 @@ clip-factory renderer MCP server with alternating scenic insert support.
 Behavior:
 - prefers clip-specific transcript artifacts first, then stem-level transcript artifacts
 - honors refined/quran boundary suggestions when present
-- uses clip.visual_plan to alternate between the original source and AI scenic videos
+- uses clip.visual_plan to alternate between the original source and stock scenic videos
 - keeps the original clip audio throughout the whole short
 - burns subtitles/recitation text after the visual timeline is assembled
 
@@ -90,7 +90,7 @@ RENDER_TRANSITION_TYPE: str = (
 # Minimum seconds of the original speaker footage to show before any scenic insert
 # begins.  Prevents opening immediately on scenic B-roll when the speaker is
 # still establishing the recitation.
-SPEAKER_HOLD_SECS: float = float(os.environ.get("SPEAKER_HOLD_SECS", "1.5"))
+SPEAKER_HOLD_SECS: float = float(os.environ.get("SPEAKER_HOLD_SECS", "3.0"))
 
 # When true, ffmpeg samples a frame from the source video at the clip start to
 # measure mean scene brightness and automatically picks a contrasting text color
@@ -178,11 +178,10 @@ def _load_transcript_segments(stem: str, clip_number: Optional[int] = None) -> T
     if clip_number is not None:
         clip_stem = f"{stem}__clip{clip_number:02d}"
         preferred += [
-            TRANSCRIPTS / f"{clip_stem}.quran_guard.verbose.json",  # (1) best
-            TRANSCRIPTS / f"{clip_stem}.refined.verbose.json",       # (2)
-            TRANSCRIPTS / f"{clip_stem}.quran_guard.srt",            # (3)
-            TRANSCRIPTS / f"{clip_stem}.refined.captions.srt",       # (4)
-            TRANSCRIPTS / f"{clip_stem}.refined.srt",                # (5)
+            TRANSCRIPTS / f"{clip_stem}.quran_guard.verbose.json",
+            TRANSCRIPTS / f"{clip_stem}.refined.verbose.json",
+            TRANSCRIPTS / f"{clip_stem}.quran_guard.srt",
+            TRANSCRIPTS / f"{clip_stem}.refined.srt",
         ]
 
     # Stem-level fallbacks (6–11).
@@ -191,8 +190,6 @@ def _load_transcript_segments(stem: str, clip_number: Optional[int] = None) -> T
         TRANSCRIPTS / f"{stem}.refined.verbose.json",
         TRANSCRIPTS / f"{stem}.verbose.json",
         TRANSCRIPTS / f"{stem}.quran_guard.srt",
-        TRANSCRIPTS / f"{stem}.refined.captions.srt",
-        TRANSCRIPTS / f"{stem}.captions.srt",
         TRANSCRIPTS / f"{stem}.refined.srt",
         TRANSCRIPTS / f"{stem}.srt",
     ]
@@ -343,19 +340,70 @@ def _preset_filter(preset: str) -> str:
 
 def _validate_font(font_name: str) -> dict:
     """
-    Check via fontconfig whether font_name resolves to itself or a fallback.
+    Check whether font_name is reachable by libass.
 
-    Uses `fc-match --format=%{family}` which returns the family name of the
-    font fontconfig would actually use.  Geeza Pro reports as a comma-separated
-    localised name list: "Geeza Pro,گیزا پرو,गीज़ा प्रो,جيزة" — any token
-    matching font_name (case-insensitive) counts as an exact match.
+    Two resolution paths, checked in the order libass itself uses them:
 
-    Returns a dict with:
-      font_name     — the configured name
-      resolved      — the first family name fontconfig returned
-      exact_match   — True if fontconfig found the font directly
-      warning       — non-empty string if substitution is likely
+    Path 1 — ASS_FONTSDIR is set:
+        libass searches this directory before touching fontconfig.  We scan for
+        a .ttf/.otf/.ttc file whose stem contains font_name (case-insensitive).
+        If found → exact_match=True, source="ASS_FONTSDIR".
+        If the directory is missing or contains no matching file → exact_match=False
+        with a clear warning so the operator knows to add the font file.
+        NOTE: when ASS_FONTSDIR is set, the fc-match result is irrelevant because
+        libass bypasses fontconfig for this directory lookup.
+
+    Path 2 — ASS_FONTSDIR not set:
+        fontconfig (fc-match) determines what libass uses.  Amiri Quran is a macOS
+        system font and resolves correctly.  On Linux it is not bundled; set
+        ASS_FONTSDIR to a directory containing the .ttf to guarantee the right font.
+
+    Returns:
+      font_name     — configured font family name
+      resolved      — font or file libass will actually use
+      exact_match   — True when the intended font is confirmed available
+      source        — "ASS_FONTSDIR" | "fontconfig" | "none"
+      warning       — non-empty when a substitution or missing-font is likely
     """
+    # ── Path 1: explicit fonts directory ──────────────────────────────────────
+    if ASS_FONTSDIR:
+        fd = Path(ASS_FONTSDIR)
+        if not fd.is_dir():
+            return {
+                "font_name": font_name,
+                "resolved": "unknown",
+                "exact_match": False,
+                "source": "ASS_FONTSDIR",
+                "warning": (
+                    f"ASS_FONTSDIR='{ASS_FONTSDIR}' is set but the directory does "
+                    f"not exist.  libass will fall back to fontconfig with no font "
+                    f"guarantee.  Create the directory and add a .ttf/.otf for "
+                    f"'{font_name}', or unset ASS_FONTSDIR."
+                ),
+            }
+        _font_exts = {".ttf", ".otf", ".ttc"}
+        font_files = [p for p in fd.iterdir() if p.suffix.lower() in _font_exts]
+        match = next(
+            (p for p in font_files if font_name.lower().replace(" ", "") in p.stem.lower().replace(" ", "")),
+            None,
+        )
+        return {
+            "font_name": font_name,
+            "resolved": match.name if match else f"not found in {fd.name}/",
+            "exact_match": bool(match),
+            "source": "ASS_FONTSDIR",
+            "warning": (
+                ""
+                if match
+                else (
+                    f"ASS_FONTSDIR='{ASS_FONTSDIR}' contains no file matching "
+                    f"'{font_name}' (.ttf/.otf/.ttc).  Add the font file or unset "
+                    f"ASS_FONTSDIR to fall back to fontconfig."
+                )
+            ),
+        }
+
+    # ── Path 2: fontconfig (fc-match) ─────────────────────────────────────────
     try:
         result = subprocess.run(
             ["fc-match", "--format=%{family}", font_name],
@@ -363,28 +411,44 @@ def _validate_font(font_name: str) -> dict:
         )
         raw = result.stdout.strip().split("\n")[0].strip()
         # Localised family names are comma-separated inside the format string.
+        
         resolved_names = [n.strip() for n in raw.split(",") if n.strip()]
         primary = resolved_names[0] if resolved_names else "unknown"
         exact = any(n.lower() == font_name.lower() for n in resolved_names)
-        warning = (
-            ""
-            if exact
-            else (
-                f"fontconfig resolved '{font_name}' to '{primary}'. "
-                f"Arabic glyphs may render with a fallback font causing uneven "
-                f"letter sizes.  Set ASS_FONTSDIR to a directory containing "
-                f"'{font_name}' to guarantee the correct font is used."
-            )
-        )
-        return {"font_name": font_name, "resolved": primary, "exact_match": exact, "warning": warning}
+        return {
+            "font_name": font_name,
+            "resolved": primary,
+            "exact_match": exact,
+            "source": "fontconfig",
+            "warning": (
+                ""
+                if exact
+                else (
+                    f"fontconfig resolved '{font_name}' to '{primary}'. "
+                    f"Arabic glyphs may render with a fallback font causing uneven "
+                    f"letter sizes.  Fix: install '{font_name}' system-wide, or set "
+                    f"ASS_FONTSDIR to a directory containing its .ttf/.otf file."
+                )
+            ),
+        }
     except FileNotFoundError:
         return {
-            "font_name": font_name, "resolved": "unknown", "exact_match": False,
-            "warning": "fc-match not available — cannot validate font; libass will use fontconfig defaults",
+            "font_name": font_name,
+            "resolved": "unknown",
+            "exact_match": False,
+            "source": "none",
+            "warning": (
+                "fc-match not found — cannot validate font via fontconfig.  "
+                "Set ASS_FONTSDIR to a directory containing the font file to "
+                "guarantee libass uses the correct Arabic font."
+            ),
         }
     except Exception as e:
         return {
-            "font_name": font_name, "resolved": "unknown", "exact_match": False,
+            "font_name": font_name,
+            "resolved": "unknown",
+            "exact_match": False,
+            "source": "none",
             "warning": f"font validation error: {e}",
         }
 
@@ -523,10 +587,10 @@ def _enforce_speaker_hold(plan: List[dict], duration: float) -> List[dict]:
     """
     hold = SPEAKER_HOLD_SECS
 
-    # Step 1 & 2: clamp and filter ai_video beats.
+    # Step 1 & 2: clamp and filter scenic insert beats (ai_video or stock_video).
     ai_beats: List[dict] = []
     for beat in plan:
-        if beat["type"] != "ai_video":
+        if beat["type"] != "stock_video":
             continue
         b = dict(beat)
         s = max(b["start_offset_sec"], hold)
@@ -724,7 +788,7 @@ def _middle_insert_plan(duration: float, ai_duration: float = 1.8) -> List[dict]
     end = min(duration - hold, start + ai_duration)
     return [
         {"type": "original", "start_offset_sec": 0.0, "end_offset_sec": round(start, 2), "duration_sec": round(start, 2), "asset_slot": 0, "prompt": "", "notes": "original_intro"},
-        {"type": "ai_video", "start_offset_sec": round(start, 2), "end_offset_sec": round(end, 2), "duration_sec": round(end - start, 2), "asset_slot": 1, "prompt": "", "notes": "manual_middle_insert"},
+        {"type": "stock_video", "start_offset_sec": round(start, 2), "end_offset_sec": round(end, 2), "duration_sec": round(end - start, 2), "asset_slot": 1, "prompt": "", "notes": "manual_middle_insert"},
         {"type": "original", "start_offset_sec": round(end, 2), "end_offset_sec": round(duration, 2), "duration_sec": round(duration - end, 2), "asset_slot": 0, "prompt": "", "notes": "original_outro"},
     ]
 
@@ -733,7 +797,7 @@ def _normalize_visual_plan(plan: List[dict], duration: float) -> List[dict]:
     beats: List[dict] = []
     for beat in plan or []:
         beat_type = str(beat.get("type") or "").lower().strip()
-        if beat_type not in {"original", "ai_video"}:
+        if beat_type not in {"original", "stock_video"}:
             continue
         s = max(0.0, min(duration, _safe_float(beat.get("start_offset_sec"), 0.0)))
         e = max(0.0, min(duration, _safe_float(beat.get("end_offset_sec"), 0.0)))
@@ -754,18 +818,13 @@ def _normalize_visual_plan(plan: List[dict], duration: float) -> List[dict]:
     return beats or [{"type": "original", "start_offset_sec": 0.0, "end_offset_sec": round(duration, 2), "duration_sec": round(duration, 2), "asset_slot": 0, "prompt": "", "notes": "full_original"}]
 
 
-def _find_ai_asset(stem: str, clip_number: int, asset_slot: int) -> Optional[Path]:
+def _find_stock_asset(stem: str, clip_number: int, asset_slot: int) -> Optional[Path]:
     prefix = f"{_slug(stem)}__clip{clip_number:02d}__ai{asset_slot:02d}"
     for ext in VIDEO_EXTS:
-        exact = BROLL / f"{prefix}__veo{ext}"
+        exact = BROLL / f"{prefix}__stock{ext}"
         if exact.exists():
             return exact
-    candidates = sorted(
-        [p for p in BROLL.glob(f"{prefix}*.mp4") if p.is_file()],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
+    return None
 
 
 def _build_visual_plan_for_render(clip: dict, duration: float, broll_file: Optional[str]) -> List[dict]:
@@ -872,7 +931,7 @@ def _build_visual_timeline_filter(
 def _render_one(
     stem: str,
     clip_number: int,
-    preset: str = "golden-islamic",
+    preset: str = "dark-soft-recitation",
     burn_subtitles: bool = True,
     broll_file: Optional[str] = None,
     auto_broll: bool = False,
@@ -909,12 +968,12 @@ def _render_one(
     ai_paths: Dict[int, Path] = {}
     if auto_broll:
         for beat in visual_plan:
-            if beat["type"] != "ai_video":
+            if beat["type"] != "stock_video":
                 continue
             slot = int(beat.get("asset_slot") or 0)
             if slot < 1 or slot in ai_paths:
                 continue
-            asset = _find_ai_asset(stem, clip_number, slot)
+            asset = _find_stock_asset(stem, clip_number, slot)
             if asset:
                 ai_paths[slot] = asset
 
@@ -948,13 +1007,13 @@ def _render_one(
                 f":fontsdir='{_escape_filter_path(Path(ASS_FONTSDIR))}'"
                 if ASS_FONTSDIR else ""
             )
-            subtitle_filter_str = f"subtitles=filename='{escaped}'{fontsdir_part}:wrap_unicode=1"
+            subtitle_filter_str = f"ass=filename='{escaped}'{fontsdir_part}:shaping=complex"
             subtitle_source = str(ass_tempfile)
         elif not subtitle_source:
             subtitle_source = "no transcript found for clip"
 
     ffmpeg = get_ffmpeg()
-    used_broll = any(beat["type"] == "ai_video" for beat in visual_plan) and bool(ai_paths)
+    used_broll = any(beat["type"] == "stock_video" for beat in visual_plan) and bool(ai_paths)
 
     cmd: List[str]
     if audio_only:
@@ -1084,20 +1143,19 @@ def _render_one(
 _startup_font_check = _validate_font(_text_cfg.font)
 if not _startup_font_check["exact_match"]:
     import sys as _sys
+    _warn = _startup_font_check.get("warning", f"Font '{_text_cfg.font}' not found.")
     print(
-        f"\nWARNING[clip-factory-renderer]: font '{_text_cfg.font}' not found by "
-        f"fontconfig — resolved to '{_startup_font_check['resolved']}' instead.\n"
+        f"\nWARNING[clip-factory-renderer]: {_warn}\n"
         f"Arabic glyphs will render with the fallback font and may appear misshapen.\n"
-        f"Fix: set ASS_FONTSDIR=<dir containing '{_text_cfg.font}'> in .env, or\n"
-        f"     install the font system-wide (macOS: already available as Geeza Pro).\n"
         f"To abort on startup instead of warning: set ASS_FONT_STRICT=true in .env.\n",
         file=_sys.stderr,
         flush=True,
     )
     if os.environ.get("ASS_FONT_STRICT", "").strip().lower() in ("1", "true", "yes"):
         raise RuntimeError(
-            f"Font '{_text_cfg.font}' not available via fontconfig "
-            f"(resolved to '{_startup_font_check['resolved']}'). "
+            f"Font '{_text_cfg.font}' not available "
+            f"(source={_startup_font_check['source']}, "
+            f"resolved='{_startup_font_check['resolved']}'). "
             f"Set ASS_FONTSDIR or unset ASS_FONT_STRICT to allow fallback."
         )
 
@@ -1151,15 +1209,15 @@ def suggest_broll_for_clip(stem: str, clip_number: int) -> dict:
     visual_plan = _build_visual_plan_for_render(clip, duration, None)
     assets = []
     for beat in visual_plan:
-        if beat["type"] != "ai_video":
+        if beat["type"] != "stock_video":
             continue
         slot = int(beat.get("asset_slot") or 0)
-        asset = _find_ai_asset(stem, clip_number, slot)
+        asset = _find_stock_asset(stem, clip_number, slot)
         assets.append(
             {
                 "asset_slot": slot,
                 "prompt": beat.get("prompt", ""),
-                "expected_file": str(BROLL / f"{_slug(stem)}__clip{clip_number:02d}__ai{slot:02d}__veo.mp4"),
+                "expected_prefix": str(BROLL / f"{_slug(stem)}__clip{clip_number:02d}__ai{slot:02d}") + "__stock.*",
                 "existing_file": str(asset) if asset else "",
                 "start_offset_sec": beat.get("start_offset_sec", 0.0),
                 "end_offset_sec": beat.get("end_offset_sec", 0.0),
@@ -1179,7 +1237,7 @@ def suggest_broll_for_clip(stem: str, clip_number: int) -> dict:
 def render_clip_from_candidate(
     stem: str,
     clip_number: int,
-    preset: str = "golden-islamic",
+    preset: str = "dark-soft-recitation",
     burn_subtitles: bool = True,
     broll_file: Optional[str] = None,
     auto_broll: bool = False,
@@ -1201,12 +1259,15 @@ def render_clip_from_candidate(
         overwrite=overwrite,
     )
 
+def _verse_key_sort(key: str):
+    return tuple(map(int, key.split(":")))
+
 
 @mcp.tool()
 def batch_render_from_candidates(
     stem: str,
     clip_numbers: Optional[List[int]] = None,
-    preset: str = "golden-islamic",
+    preset: str = "dark-soft-recitation",
     burn_subtitles: bool = True,
     auto_broll: bool = True,
     max_renders: int = 5,

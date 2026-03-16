@@ -11,7 +11,10 @@ import subprocess
 from mcp.server.fastmcp import FastMCP
 from helpers import get_ffmpeg
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+from bootstrap import resolve_root_and_load_env
+
+ROOT = resolve_root_and_load_env()
+
 INCOMING = ROOT / "incoming"
 FINAL = ROOT / "final"
 

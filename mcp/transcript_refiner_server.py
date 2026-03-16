@@ -20,16 +20,19 @@ for _p in (_THIS_DIR, _PROJECT_ROOT):
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from google import genai
 from mcp.server.fastmcp import FastMCP
 
-from helpers import clean_arabic_for_captions, atomic_write_json
+from helpers import clean_arabic_for_captions, get_ffmpeg, atomic_write_json
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+from bootstrap import resolve_root_and_load_env
+import llm_client
+
+ROOT = resolve_root_and_load_env()
+
 TRANSCRIPTS = ROOT / "transcripts"
 CLIPS = ROOT / "clips"
 
-load_dotenv(ROOT / ".env")
+
 
 mcp = FastMCP("clip-factory-transcript-refiner", json_response=True)
 
@@ -54,15 +57,12 @@ class SegmentRefineResult(BaseModel):
     corrected_segments: List[CorrectedSegment]
 
 
-def _client():
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set in environment or .env")
-    return genai.Client(api_key=api_key)
-
-
 def _model_name() -> str:
-    return os.environ.get("GEMINI_REFINER_MODEL") or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    # Legacy Gemini env vars take priority so existing configs keep working.
+    legacy = (os.environ.get("GEMINI_REFINER_MODEL") or os.environ.get("GEMINI_MODEL") or "").strip()
+    if legacy:
+        return legacy
+    return llm_client._text_model_name()
 
 
 def _load_verbose(stem: str):
@@ -174,17 +174,17 @@ Do not include commentary.
 NON-NEGOTIABLE RULES:
 - Keep the SAME number of segments.
 - Keep each segment aligned 1-to-1 with its LOCAL chunk index.
-- Correct Arabic spelling, obvious ASR mistakes, spacing, and light punctuation.
+- Correct Arabic spelling, obvious ASR mistakes, spacing, and punctuation.
 - Do not summarize.
 - Do not merge segments.
 - Do not split segments.
 - Do not add any text that is not supported by the original segment.
-- Do not add tashkeel.
 - Preserve meaning as closely as possible.
 - Keep Islamic terminology natural in Arabic.
 - If a phrase might be Quran and you are not absolutely sure, stay very close to the original wording instead of guessing.
 - If a segment is already good, keep it nearly unchanged.
-- ABSOLUTELY NO TASHKEEL OR DIACRITICS. Do not use ً, ٌ, ٍ, َ, ُ, ِ, ّ, or ْ anywhere in your response. Only output pure Arabic letters.
+- Preserve Arabic diacritics and Quranic marks when they already exist in the source text.
+- If the source text has no diacritics, do not add them unless the segment is an exact Quran match from a trusted Quran source.
 
 Output one corrected text entry for every local index shown below.
 
@@ -206,25 +206,25 @@ def _coerce_refine_response(response_text: str, chunk: List[dict]) -> List[str]:
 
 
 def _refine_chunk(chunk: List[dict], retries: int = 1, retry_sleep_sec: float = 1.0) -> List[str]:
+    """Call the configured LLM to correct a chunk of transcript segments.
+    When TRANSCRIPT_REFINER_USE_LLM=false, returns originals unchanged (no API call)."""
+    originals = [item["text"].strip() for item in chunk]
+
+    if not llm_client.transcript_refiner_use_llm():
+        return originals
+
     prompt = _build_chunk_prompt(chunk)
-    client = _client()
+    llm = llm_client.get_text_llm()
 
     for attempt in range(retries + 1):
         try:
-            response = client.models.generate_content(
-                model=_model_name(),
-                contents=prompt,
-                config={
-                    "response_mime_type": "application/json",
-                    "response_json_schema": SegmentRefineResult.model_json_schema(),
-                },
-            )
-            return _coerce_refine_response(response.text, chunk)
+            raw = llm.generate_json(prompt)
+            return _coerce_refine_response(raw, chunk)
         except Exception:
             if attempt < retries:
                 time.sleep(retry_sleep_sec)
 
-    return [item["text"].strip() for item in chunk]
+    return originals
 
 
 def _text(seg: dict) -> str:
@@ -413,7 +413,8 @@ def _save_clip_outputs(
             if str(seg.get("text", "")).strip()
         ),
         "refiner": {
-            "enabled": True,
+            "enabled": llm_client.transcript_refiner_use_llm(),
+            "provider": llm_client._text_provider(),
             "model": _model_name(),
             "segment_count": len(refined_segments),
             "chunk_count": chunk_count,

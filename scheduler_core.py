@@ -8,7 +8,9 @@ from datetime import datetime, timedelta, timezone, date
 from typing import Optional, List
 from zoneinfo import ZoneInfo
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+from bootstrap import resolve_root_and_load_env
+
+ROOT = resolve_root_and_load_env()
 
 POOL_FILE = ROOT / "pool" / "video_pool.json"
 QUEUE_FILE = ROOT / "publisher" / "publish_queue.json"

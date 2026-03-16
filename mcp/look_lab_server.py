@@ -10,13 +10,16 @@ from mcp.server.fastmcp import FastMCP
 
 from helpers import get_ffmpeg, atomic_write_json
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+from bootstrap import resolve_root_and_load_env
+
+ROOT = resolve_root_and_load_env()
+
 LOOKLAB = ROOT / "looklab"
 PRESETS_DIR = LOOKLAB / "presets"
 PREVIEWS_DIR = LOOKLAB / "previews"
 RENDERS_DIR = LOOKLAB / "renders"
 
-load_dotenv(ROOT / ".env")
+
 
 mcp = FastMCP("clip-factory-look-lab", json_response=True)
 
@@ -216,7 +219,17 @@ def _build_filter_chain(
     warmth_shift: float = 0.0,
     saturation_boost: float = 0.0,
     contrast_boost: float = 0.0,
-) -> tuple[str, Dict[str, float | str]]:
+) -> tuple[List[str], Dict[str, float | str]]:
+    """Return (vf_args, settings).
+
+    vf_args is ready to splice into an ffmpeg command:
+      ["-vf", chain]            — when glow is off (simple linear chain)
+      ["-filter_complex", fc,   — when glow is on (graph with split/blend)
+       "-map", "[vout]"]
+
+    The glow effect requires splitting the stream into base + blurred copies
+    and blending them, which is only valid inside -filter_complex, not -vf.
+    """
     p = _preset_values(preset)
 
     contrast = _clamp(_safe_float(p.get("contrast"), 1.0) + contrast_boost, 0.6, 1.8)
@@ -228,32 +241,47 @@ def _build_filter_chain(
     vignette = _clamp(_safe_float(p.get("vignette"), 0.0) + vignette_strength, 0.0, 0.45)
     glow = _clamp(_safe_float(p.get("glow"), 0.0) + glow_strength, 0.0, 0.25)
 
-    filters: List[str] = [f"eq=contrast={contrast:.3f}:brightness={brightness:.3f}:saturation={saturation:.3f}"]
-
+    # Filters applied before glow (linear colour corrections)
+    pre_filters: List[str] = [f"eq=contrast={contrast:.3f}:brightness={brightness:.3f}:saturation={saturation:.3f}"]
     if abs(warmth) > 0.001:
         rs = _clamp(warmth, -0.2, 0.2)
         bs = _clamp(-warmth * 0.75, -0.2, 0.2)
-        filters.append(f"colorbalance=rs={rs:.3f}:gs=0.000:bs={bs:.3f}")
-
+        pre_filters.append(f"colorbalance=rs={rs:.3f}:gs=0.000:bs={bs:.3f}")
     if sharpness > 0.001:
-        filters.append(f"unsharp=5:5:{sharpness:.3f}:5:5:0.0")
+        pre_filters.append(f"unsharp=5:5:{sharpness:.3f}:5:5:0.0")
 
-    if glow > 0.001:
-        filters.append(
-            f"split=2[base][blur];[blur]gblur=sigma={2.0 + glow * 8.0:.2f}[soft];"
-            f"[base][soft]blend=all_mode=screen:all_opacity={0.10 + glow * 0.55:.3f}"
-        )
-
+    # Filters applied after glow (texture / vignette)
+    post_filters: List[str] = []
     if grain > 0.001:
         strength = int(round(3 + grain * 80))
-        filters.append(f"noise=alls={strength}:allf=t")
-
+        post_filters.append(f"noise=alls={strength}:allf=t")
     if vignette > 0.001:
         angle = _clamp(vignette * 2.4, 0.05, 1.2)
-        filters.append(f"vignette=angle={angle:.3f}")
+        post_filters.append(f"vignette=angle={angle:.3f}")
 
-    filter_chain = ",".join(filters)
-    settings = {
+    if glow > 0.001:
+        sigma = 2.0 + glow * 8.0
+        opacity = 0.10 + glow * 0.55
+        # Build a filter_complex graph: colour-grade → split → blur one copy
+        # → screen-blend back for the bloom/glow effect.
+        fc_parts: List[str] = []
+        fc_parts.append(f"[0:v]{','.join(pre_filters)}[pre]")
+        fc_parts.append(f"[pre]split=2[base][blur]")
+        fc_parts.append(f"[blur]gblur=sigma={sigma:.2f}[soft]")
+        if post_filters:
+            fc_parts.append(f"[base][soft]blend=all_mode=screen:all_opacity={opacity:.3f}[blended]")
+            fc_parts.append(f"[blended]{','.join(post_filters)}[vout]")
+        else:
+            fc_parts.append(f"[base][soft]blend=all_mode=screen:all_opacity={opacity:.3f}[vout]")
+        filter_complex = ";".join(fc_parts)
+        vf_args: List[str] = ["-filter_complex", filter_complex, "-map", "[vout]"]
+        filter_chain_str = filter_complex
+    else:
+        all_filters = pre_filters + post_filters
+        filter_chain_str = ",".join(all_filters)
+        vf_args = ["-vf", filter_chain_str]
+
+    settings: Dict[str, float | str] = {
         "preset": preset,
         "contrast": contrast,
         "brightness": brightness,
@@ -263,10 +291,10 @@ def _build_filter_chain(
         "grain": grain,
         "vignette": vignette,
         "glow": glow,
-        "filter_chain": filter_chain,
+        "filter_chain": filter_chain_str,
         "notes": p.get("notes", ""),
     }
-    return filter_chain, settings
+    return vf_args, settings
 
 
 def _run_ffmpeg(cmd: List[str]) -> dict:
@@ -413,7 +441,7 @@ def preview_grade(
     if start_sec + duration_sec > total_duration and total_duration > 0:
         duration_sec = max(1.0, total_duration - start_sec)
 
-    filter_chain, settings = _build_filter_chain(
+    vf_args, settings = _build_filter_chain(
         preset,
         grain_strength=grain_strength,
         vignette_strength=vignette_strength,
@@ -435,8 +463,7 @@ def preview_grade(
         f"{duration_sec:.3f}",
         "-i",
         str(path),
-        "-vf",
-        filter_chain,
+        *vf_args,
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -490,7 +517,7 @@ def apply_look_preset(
     _ensure_dirs()
     path = _resolve_input_path(source_path)
     kind = _media_kind(path)
-    filter_chain, settings = _build_filter_chain(
+    vf_args, settings = _build_filter_chain(
         preset,
         grain_strength=grain_strength,
         vignette_strength=vignette_strength,
@@ -513,8 +540,7 @@ def apply_look_preset(
         "-y",
         "-i",
         str(path),
-        "-vf",
-        filter_chain,
+        *vf_args,
     ]
 
     if kind == "video":

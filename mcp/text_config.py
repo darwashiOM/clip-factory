@@ -18,8 +18,8 @@ Environment variables (all optional — all have sensible defaults)
 
   Font
   ────
-  SUBTITLE_FONT             Font family for subtitle mode        default: Geeza Pro
-  RECITATION_FONT           Font family for recitation mode      default: Geeza Pro
+SUBTITLE_FONT             Font family for subtitle mode        default: Amiri
+RECITATION_FONT           Font family for recitation mode      default: Amiri
                             (falls back to SUBTITLE_FONT if RECITATION_FONT unset)
   SUBTITLE_FONTSIZE         Font size for subtitle mode          default: 60
   RECITATION_FONTSIZE       Font size for recitation mode        default: 88
@@ -183,7 +183,7 @@ class TextStyleConfig:
 
 _SUBTITLE_PRESET: dict = dict(
     mode="subtitle",
-    font="Geeza Pro",
+    font="Amiri Quran",
     fontsize=60,
     primary_color="&H00FFFFFF",
     secondary_color="&H000000FF",
@@ -211,7 +211,7 @@ _SUBTITLE_PRESET: dict = dict(
 
 _CENTER_RECITATION_PRESET: dict = dict(
     mode="center_recitation",
-    font="Geeza Pro",
+    font="Amiri Quran",
     fontsize=88,
     primary_color="&H00FFFFFF",
     secondary_color="&H000000FF",

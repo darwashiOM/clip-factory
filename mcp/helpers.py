@@ -34,7 +34,6 @@ from typing import List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from text_config import TextStyleConfig
 
-
 _SENTENCE_BREAK_RE = re.compile(r"([،,:;؛.!?؟])")
 
 
@@ -56,8 +55,12 @@ def clean_arabic_for_captions(text: str) -> str:
     display-ready string from an in-memory copy.
     """
     text = str(text or "")
-    text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r'[^\u0621-\u063A\u0641-\u064A\s0-9٠-٩\.\,\!\?\:\;\"\'،؛؟\-]', '', text)
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(
+        r'[^\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF\s0-9٠-٩\.\,\!\?\:\;\"\'،؛؟\-]',
+        '',
+        text,
+    )
     return text
 
 
@@ -183,11 +186,12 @@ def _choose_balanced_break(words: List[str], max_words_per_line: int, max_lines:
     #
     # No-discard policy: silently dropping Quran canonical text is unacceptable.
     # An extra line on screen is recoverable; missing words in a rendered verse
-    # are not.  We compute the minimum number of lines needed to hold all words
-    # and use that as the effective cap, clamped to a reasonable absolute ceiling
-    # (max_lines + 4).  The caller's max_lines is a soft target, not a hard kill.
+    # are not.  effective_max equals exactly the lines needed to hold all words —
+    # no artificial ceiling.  max_lines is a soft visual target, not a word-count
+    # kill switch.  If the result overflows the visible area, the fix is to widen
+    # max_words_per_line via ASS_MAX_WORDS_PER_LINE, not to truncate text.
     needed = (len(words) + max_words_per_line - 1) // max(1, max_words_per_line)
-    effective_max = max(max_lines, min(needed, max_lines + 4))
+    effective_max = max(max_lines, needed)
     lines: List[List[str]] = []
     idx = 0
     while idx < len(words) and len(lines) < effective_max:
@@ -317,18 +321,6 @@ def _build_ass_header(cfg: "TextStyleConfig") -> str:
 def _build_lead_tag(cfg: "TextStyleConfig") -> str:
     r"""
     Build the per-dialogue ASS override tag string.
-
-    The \anN tag here must match cfg.alignment so each Dialogue line is
-    self-contained (resilient to style-block inheritance issues):
-      \an2  bottom-center  (subtitle mode)
-      \an5  middle-center  (center_recitation mode)
-
-    blur, bord, shad are also repeated per-event as overrides to avoid any
-    style-inheritance ambiguity in multi-style ASS files.
-
-    When cfg.animate is True, a subtle breath animation is added:
-      - fade in / out (fade_in_ms, fade_out_ms)
-      - gentle scale pulse: starts at 97%, grows to 103%, settles at 100%
     """
     an = cfg.alignment
     base = (
@@ -337,6 +329,12 @@ def _build_lead_tag(cfg: "TextStyleConfig") -> str:
         rf"\bord{cfg.outline_width:.1f}"
         rf"\shad{cfg.shadow_size:.1f}"
     )
+
+    if an == 5:
+        y_offset = _env_int_local("ASS_CENTER_Y_OFFSET", 0)
+        if y_offset != 0:
+            base += rf"\pos(540,{960 + y_offset})"
+
     if cfg.animate:
         base += (
             rf"\fad({cfg.fade_in_ms},{cfg.fade_out_ms})"
@@ -345,7 +343,6 @@ def _build_lead_tag(cfg: "TextStyleConfig") -> str:
             rf"\t(140,240,\fscx100\fscy100)"
         )
     return base + "}"
-
 
 def _escape_ass_text(text: str) -> str:
     r"""
@@ -368,6 +365,196 @@ def _escape_ass_text(text: str) -> str:
 
 
 # ─── Main ASS generation ───────────────────────────────────────────────────────
+def _env_bool_local(key: str, default: bool) -> bool:
+    val = os.environ.get(key, "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "on")
+
+
+def _env_float_local(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int_local(key: str, default: int) -> int:
+    try:
+        return int(os.environ.get(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_str_local(key: str, default: str) -> str:
+    val = os.environ.get(key, "").strip()
+    return val if val else default
+
+
+def _split_words_into_lines(
+    text: str,
+    max_words_per_line: int,
+    max_lines: int,
+    *,
+    clean: bool,
+) -> List[List[str]]:
+    if clean:
+        text = clean_arabic_for_captions(text)
+    if not text:
+        return []
+
+    text = _SENTENCE_BREAK_RE.sub(r"\1 ", text)
+    words = [w for w in text.split() if w]
+    if not words:
+        return []
+
+    return _choose_balanced_break(
+        words,
+        max_words_per_line=max_words_per_line,
+        max_lines=max_lines,
+    )
+
+
+def _flatten_word_lines(lines: List[List[str]]) -> List[str]:
+    out: List[str] = []
+    for line in lines:
+        out.extend(line)
+    return out
+
+
+def _allocate_word_windows(words: List[str], start_sec: float, end_sec: float) -> List[tuple[float, float]]:
+    total_duration = max(0.12, end_sec - start_sec)
+    if not words:
+        return []
+
+    weights: List[float] = []
+    for word in words:
+        stripped = re.sub(r"[^\u0600-\u06FFA-Za-z0-9]", "", word)
+        weights.append(max(1.0, float(len(stripped) or 1)))
+
+    total_weight = sum(weights) or float(len(words))
+    cursor = start_sec
+    windows: List[tuple[float, float]] = []
+
+    for idx, weight in enumerate(weights):
+        piece = total_duration * (weight / total_weight)
+        next_cursor = end_sec if idx == len(weights) - 1 else cursor + piece
+        windows.append((cursor, next_cursor))
+        cursor = next_cursor
+
+    return windows
+
+
+def _build_inline_active_word_text(
+    lines: List[List[str]],
+    active_word_index: int,
+    *,
+    active_color: str,
+    active_outline: str,
+    active_shadow: str,
+    active_blur: float,
+    active_scale: float,
+) -> str:
+    """
+    Build one full highlighted sentence where only the active word is restyled.
+
+    Important:
+    - Timing order stays in logical transcript order.
+    - For highlighted ASS text only, we emit each Arabic line in reversed token
+      order because inline ASS override tags break libass bidi handling across
+      word runs.
+    - We DO NOT reverse timing or flat-word allocation. We only reverse the
+      visual emission order of tagged chunks.
+    """
+    scale_pct = int(round(active_scale * 100))
+    active_tag = (
+        rf"{{\1c{active_color}"
+        rf"\3c{active_outline}"
+        rf"\4c{active_shadow}"
+        rf"\blur{active_blur:.1f}"
+        rf"\fscx{scale_pct}\fscy{scale_pct}}}"
+    )
+    reset_tag = r"{\rDefault}"
+
+    pieces: List[str] = []
+    flat_idx = 0
+
+    for line in lines:
+        indexed_words = []
+        for word in line:
+            indexed_words.append((flat_idx, word))
+            flat_idx += 1
+
+        line_buf: List[str] = []
+
+        # Emit reversed so visually it stays RTL even with inline ASS tags
+        for visual_pos, (orig_idx, word) in enumerate(reversed(indexed_words)):
+            token = _escape_ass_text(word)
+
+            if visual_pos > 0:
+                line_buf.append(" ")
+
+            if orig_idx == active_word_index:
+                line_buf.append(f"{active_tag}{token}{reset_tag}")
+            else:
+                line_buf.append(token)
+
+        pieces.append("".join(line_buf))
+
+    return r"\N".join(pieces)
+
+
+def _build_static_lead_tag(cfg: "TextStyleConfig") -> str:
+    base = (
+        rf"{{\an{cfg.alignment}"
+        rf"\blur{cfg.blur:.1f}"
+        rf"\bord{cfg.outline_width:.1f}"
+        rf"\shad{cfg.shadow_size:.1f}"
+    )
+
+    if cfg.alignment == 5:
+        y_offset = _env_int_local("ASS_CENTER_Y_OFFSET", 0)
+        if y_offset != 0:
+            base += rf"\pos(540,{960 + y_offset})"
+
+    return base + "}"
+
+def _segment_word_windows_from_transcript(
+    seg: dict,
+    clip_start: float,
+    clip_end: float,
+    display_words: List[str],
+) -> List[tuple[float, float]]:
+    raw_words = seg.get("words") or []
+    usable = []
+
+    for item in raw_words:
+        try:
+            w_start = float(item.get("start", 0.0))
+            w_end = float(item.get("end", w_start))
+        except (TypeError, ValueError):
+            continue
+
+        token = str(item.get("word", "")).strip()
+        if not token:
+            continue
+
+        if w_end <= clip_start or w_start >= clip_end:
+            continue
+
+        usable.append(
+            {
+                "word": token,
+                "start": max(w_start, clip_start) - clip_start,
+                "end": min(w_end, clip_end) - clip_start,
+            }
+        )
+
+    if len(usable) != len(display_words):
+        return []
+
+    return [(round(x["start"], 3), round(x["end"], 3)) for x in usable]
+
 
 def generate_clip_ass(
     segments: List[dict],
@@ -380,74 +567,35 @@ def generate_clip_ass(
     """
     Generate an ASS text file for a specific clip time window.
 
-    Supports both style modes via the config object:
-      subtitle          — bottom-center, small text, standard subtitle layout
-      center_recitation — middle-center, large Arabic display text, cinematic
+    In normal mode:
+      - one Dialogue event per segment
 
-    Text pipeline per segment (all stages are explicit — no hidden mutations):
-
-      Stage 1  choose render text
-               segment_render_text() prefers quran_guard.render_text when present
-               (corpus-canonical), falls back to seg["text"] (Gemini-refined or ASR).
-
-      Stage 2  normalise internal newlines
-               Literal \\n characters become spaces so they don't split words
-               unexpectedly.  The ASS line-break \\N is added later in Stage 4.
-
-      Stage 3  optional display cleaning
-               If do_clean is True: clean_arabic_for_captions() is applied.
-               For Quran canonical text this MUST be False — the corpus text
-               may contain ٱ (U+0671) and other characters outside the whitelist.
-
-      Stage 4  line-break for display
-               split_caption_lines() with clean=False (cleaning handled in Stage 3).
-               Uses config.max_words_per_line and config.max_lines.
-
-      Stage 5  optional Arabic reshaper + bidi  (default: OFF)
-               Enabled only when config.use_reshaper_bidi is True.
-               DEFAULT is False because libass uses HarfBuzz for Arabic glyph
-               shaping and FriBidi for bidi ordering natively.
-               Pre-processing here causes DOUBLE shaping: arabic_reshaper converts
-               letters to Unicode presentation forms (U+FE70–U+FEFF), then HarfBuzz
-               processes those already-shaped glyphs again, producing disconnected
-               letters and corrupted text in the final render.
-               Enable ASS_USE_RESHAPER_BIDI=true only if your libass build lacks
-               HarfBuzz AND you observe disconnected Arabic glyphs.
-
-      Stage 6  ASS text escaping
-               _escape_ass_text() protects \\N line-breaks and escapes literal
-               curly braces { } that would otherwise be parsed as override tags.
-
-      Stage 7  per-dialogue style tag
-               _build_lead_tag() produces the \\anN + blur/bord/shad + animation
-               overrides that are prepended to each Dialogue event text.
-
-    Args:
-        segments:    List of segment dicts with start/end/text and optional
-                     quran_guard sub-dict.
-        clip_start:  Clip start in seconds (absolute source time).
-        clip_end:    Clip end in seconds (absolute source time).
-        config:      TextStyleConfig instance.  If None, load_text_config() is
-                     called lazily.  Always pass an explicit config in production
-                     to avoid repeated env reads.
-        clean_arabic: If True,  apply clean_arabic_for_captions in Stage 3.
-                      If False, skip cleaning (required for Quran canonical text).
-                      If None (default), defers to config.clean_for_display.
-
-    Returns:
-        Complete ASS file content as a string.
+    In center_recitation + ASS_WORD_HIGHLIGHT=true mode:
+      - one Dialogue event per estimated word window
+      - the full sentence stays visible
+      - only the active word is restyled inline
+      - no duplicate transparent overlay words are used
     """
     if config is None:
         from text_config import load_text_config
         config = load_text_config()
 
-    # Determine cleaning behaviour.
-    # The renderer always passes clean_arabic=False explicitly when it has
-    # quran_guard-sourced text.  This line is the single decision point.
     do_clean: bool = config.clean_for_display if clean_arabic is None else clean_arabic
 
     header = _build_ass_header(config)
     lead_tag = _build_lead_tag(config)
+    static_lead_tag = _build_static_lead_tag(config)
+
+    highlight_enabled = (
+        getattr(config, "mode", "") == "center_recitation"
+        and _env_bool_local("ASS_WORD_HIGHLIGHT", True)
+    )
+
+    active_color = _env_str_local("ASS_ACTIVE_WORD_COLOR", "&H007878FF")
+    active_outline = _env_str_local("ASS_ACTIVE_WORD_OUTLINE_COLOR", "&H00000000")
+    active_shadow = _env_str_local("ASS_ACTIVE_WORD_SHADOW_COLOR", "&H660000FF")
+    active_scale = _env_float_local("ASS_ACTIVE_WORD_SCALE", 1.06)
+    active_blur = _env_float_local("ASS_ACTIVE_WORD_BLUR", 1.4)
 
     dialogue_lines: List[str] = []
 
@@ -455,69 +603,92 @@ def generate_clip_ass(
         seg_start = float(seg.get("start", 0))
         seg_end = float(seg.get("end", 0))
 
-        # Skip segments that do not overlap the clip window.
         if seg_end <= clip_start or seg_start >= clip_end:
             continue
 
-        # Clamp to clip boundaries; compute clip-relative timestamps for the ASS file.
         seg_start = max(seg_start, clip_start)
         seg_end = min(seg_end, clip_end)
         rel_start = seg_start - clip_start
         rel_end = seg_end - clip_start
 
-        # ── Stage 1: Choose render text ──────────────────────────────────────
         raw_text = segment_render_text(seg)
-
-        # ── Stage 2: Normalise internal newlines ─────────────────────────────
         text = raw_text.replace("\n", " ").strip()
 
-        # ── Stage 3: Optional display cleaning ───────────────────────────────
-        # For Quran text (do_clean=False): the corpus text is already canonical.
-        # clean_arabic_for_captions would strip ٱ (alef wasla) and other
-        # valid Quranic characters outside the basic 0621-063A / 0641-064A range.
         if do_clean:
             text = clean_arabic_for_captions(text)
 
         if not text:
             continue
 
-        # ── Stage 4: Line-break for display ──────────────────────────────────
-        # clean=False: Stage 3 handled any needed cleaning already.
-        text = split_caption_lines(
+        word_lines = _split_words_into_lines(
             text,
             max_words_per_line=config.max_words_per_line,
             max_lines=config.max_lines,
             clean=False,
         )
-
-        # ── Stage 5: Optional Arabic reshaper + bidi ─────────────────────────
-        # Default: OFF — see docstring for full explanation.
-        # Imports are lazy so that arabic_reshaper / python-bidi are not required
-        # when this feature is disabled (the common case).
-        if config.use_reshaper_bidi:
-            import arabic_reshaper          # noqa: PLC0415
-            from bidi.algorithm import get_display  # noqa: PLC0415
-            text = r"\N".join(
-                get_display(arabic_reshaper.reshape(line))
-                for line in text.split(r"\N")
-            )
-
-        # ── Stage 6: ASS text escaping ────────────────────────────────────────
-        text = _escape_ass_text(text)
-
-        if not text:
+        if not word_lines:
             continue
 
-        # ── Stage 7: Assemble Dialogue event ─────────────────────────────────
-        dialogue_lines.append(
-            f"Dialogue: 0,"
-            f"{sec_to_ass_time(rel_start)},"
-            f"{sec_to_ass_time(rel_end)},"
-            f"Default,,0,0,0,,{lead_tag}{text}"
-        )
+        display_word_lines = word_lines
+
+        if config.use_reshaper_bidi:
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+            display_word_lines = [
+                [get_display(arabic_reshaper.reshape(word)) for word in line]
+                for line in word_lines
+            ]
+
+        if highlight_enabled:
+            flat_words = _flatten_word_lines(display_word_lines)
+            word_windows = _segment_word_windows_from_transcript(
+                seg,
+                clip_start,
+                clip_end,
+                flat_words,
+            )
+
+            if not word_windows:
+                word_windows = _allocate_word_windows(flat_words, rel_start, rel_end)
+                
+
+            for word_idx, (word_start, word_end) in enumerate(word_windows):
+                if word_end - word_start < 0.04:
+                    continue
+
+                line_text = _build_inline_active_word_text(
+                    display_word_lines,
+                    word_idx,
+                    active_color=active_color,
+                    active_outline=active_outline,
+                    active_shadow=active_shadow,
+                    active_blur=active_blur,
+                    active_scale=active_scale,
+                )
+
+                dialogue_lines.append(
+                    f"Dialogue: 0,"
+                    f"{sec_to_ass_time(word_start)},"
+                    f"{sec_to_ass_time(word_end)},"
+                    f"Default,,0,0,0,,{static_lead_tag}{line_text}"
+                )
+        else:
+            line_text = r"\N".join(
+                " ".join(line).strip() for line in display_word_lines if line
+            )
+
+            line_text = _escape_ass_text(line_text)
+            if not line_text:
+                continue
+
+            dialogue_lines.append(
+                f"Dialogue: 0,"
+                f"{sec_to_ass_time(rel_start)},"
+                f"{sec_to_ass_time(rel_end)},"
+                f"Default,,0,0,0,,{lead_tag}{line_text}"
+            )
 
     return header + "\n".join(dialogue_lines) + "\n"
-
 
 # ─── FFmpeg binary resolution ──────────────────────────────────────────────────
 

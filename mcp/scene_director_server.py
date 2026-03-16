@@ -7,7 +7,6 @@ from typing import List, Optional, Dict, Tuple
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from google import genai
 from mcp.server.fastmcp import FastMCP
 
 # ── Bootstrap: resolve ROOT and load .env before any other import ─────────────
@@ -27,6 +26,7 @@ if ROOT != _INITIAL_ROOT and (ROOT / ".env").exists():
 
 # helpers imported here — AFTER dotenv — so text_config env vars are visible.
 from helpers import atomic_write_json, segment_render_text  # noqa: E402
+import llm_client
 
 TRANSCRIPTS = ROOT / "transcripts"
 CLIPS = ROOT / "clips"
@@ -47,7 +47,7 @@ SCENE_PLAN_POLICY_VERSION: str = "2"
 # Transition settings — must match RENDER_TRANSITION_TYPE / RENDER_TRANSITION_DURATION
 # in the renderer's .env for dissolves to feel intentional.
 _RENDER_TRANSITION_T: float = float(
-    os.environ.get("RENDER_TRANSITION_DURATION", "0.0")
+    os.environ.get("RENDER_TRANSITION_DURATION", "0.4")
 )
 _RENDER_TRANSITION_TYPE: str = (
     os.environ.get("RENDER_TRANSITION_TYPE", "dissolve").strip().lower() or "dissolve"
@@ -116,16 +116,15 @@ class VisualBeat(BaseModel):
     # type is open to three values so stock footage can be planned alongside AI.
     type: str = Field(
         description=(
-            "Beat source: 'original' (speaker/reciter footage), "
-            "'ai_video' (AI-generated scenic insert), "
+            "Beat source: 'original' (speaker/reciter footage) or "
             "'stock_video' (real scenic stock clip)"
         )
     )
     start_offset_sec: float = Field(ge=0, description="Segment start relative to clip start")
     end_offset_sec: float = Field(gt=0, description="Segment end relative to clip start")
     duration_sec: float = Field(gt=0, description="Segment duration in seconds")
-    asset_slot: int = Field(default=0, ge=0, description="1-based slot for non-original beats; 0 for original")
-    prompt: str = Field(default="", description="Generation prompt for ai_video beats; asset path hint for stock_video beats")
+    asset_slot: int = Field(default=0, ge=0, description="1-based slot for stock_video beats; 0 for original")
+    prompt: str = Field(default="", description="Stock search hint for stock_video beats")
     notes: str = Field(default="", description="Renderer notes: energy:reason or fetcher instructions")
 
 
@@ -165,8 +164,8 @@ class VisualPlanEnvelope(BaseModel):
     visual_plan: List[VisualBeat]
     # ── renderer-compatible metadata (v2) ─────────────────────────────────────
     visual_mode: str = Field(
-        default="mixed_ai",
-        description="Derived from beat types: speaker_only | mixed_ai | mixed_stock | mixed",
+        default="mixed_stock",
+        description="Derived from beat types: speaker_only | mixed_stock",
     )
     plan_policy_version: str = Field(
         default="1",
@@ -236,20 +235,14 @@ _STOPWORDS = {
 }
 
 
-def _client() -> genai.Client:
-    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set in environment or .env")
-    return genai.Client(api_key=api_key)
-
-
 def _model_name() -> str:
-    return (
+    legacy = (
         os.environ.get("GEMINI_SCENE_DIRECTOR_MODEL")
         or os.environ.get("GEMINI_SELECTION_MODEL")
         or os.environ.get("GEMINI_MODEL")
-        or "gemini-2.5-pro"
-    )
+        or ""
+    ).strip()
+    return legacy or llm_client._text_model_name()
 
 
 def _slug(s: str) -> str:
@@ -547,19 +540,17 @@ def _generate_prompt_set(stem: str, clip_number: int, clip: dict, beat_count: in
     if not clip_text:
         return _fallback_prompt_set(clip, beat_count)
 
+    # When SCENE_DIRECTOR_USE_LLM=false (the default), skip the expensive LLM call
+    # and fall through to the deterministic fallback immediately.
+    if not llm_client.scene_director_use_llm():
+        return _fallback_prompt_set(clip, beat_count)
+
     try:
-        client = _client()
-        response = client.models.generate_content(
-            model=_model_name(),
-            contents=_build_prompt_generation_request(
-                stem, clip_number, clip, clip_text, beat_count, mode
-            ),
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": PromptSet.model_json_schema(),
-            },
+        llm = llm_client.get_text_llm()
+        raw = llm.generate_json(
+            _build_prompt_generation_request(stem, clip_number, clip, clip_text, beat_count, mode)
         )
-        prompt_set = PromptSet.model_validate_json(response.text)
+        prompt_set = PromptSet.model_validate_json(raw)
         cleaned: List[PromptIdea] = []
         for idea in prompt_set.scene_prompts[:beat_count]:
             topic = _sanitize_visual_topic(idea.topic)
@@ -674,7 +665,7 @@ def _schedule_visual_plan(
         prompt = prompts[idx - 1]
         ai_beats.append(
             VisualBeat(
-                type="ai_video",
+                type="stock_video",
                 start_offset_sec=round(start_offset, 2),
                 end_offset_sec=round(end_offset, 2),
                 duration_sec=round(end_offset - start_offset, 2),
@@ -738,18 +729,11 @@ def _derive_visual_mode(plan: List[VisualBeat]) -> str:
 
     Replaces the old hardcoded "alternate_scenic" with a value that describes
     what the plan actually contains:
-      speaker_only  — all original footage
-      mixed_ai      — original + AI-generated scenic inserts
-      mixed_stock   — original + real stock scenic clips
-      mixed         — original + both AI and stock clips
+      speaker_only  - all original footage
+      mixed_stock   - original + real stock scenic clips
     """
     types = {b.type for b in plan}
-    has_ai = "ai_video" in types
     has_stock = "stock_video" in types
-    if has_ai and has_stock:
-        return "mixed"
-    if has_ai:
-        return "mixed_ai"
     if has_stock:
         return "mixed_stock"
     return "speaker_only"
@@ -791,13 +775,16 @@ def _get_clip(stem: str, clip_number: int) -> Tuple[dict, dict, List[dict]]:
 
 @mcp.tool()
 def healthcheck() -> dict:
-    return HealthResponse(
+    result = HealthResponse(
         ok=True,
         root=str(ROOT),
         transcripts_exists=TRANSCRIPTS.exists(),
         clips_exists=CLIPS.exists(),
         gemini_key_present=bool((os.environ.get("GEMINI_API_KEY") or "").strip()),
     ).model_dump()
+    result["provider"] = llm_client.provider_summary()
+    result["scene_director_use_llm"] = llm_client.scene_director_use_llm()
+    return result
 
 
 @mcp.tool()

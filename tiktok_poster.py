@@ -9,7 +9,10 @@ import mimetypes
 
 import httpx
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+
+from bootstrap import resolve_root_and_load_env
+
+ROOT = resolve_root_and_load_env()
 
 QUEUE_FILE = ROOT / "publisher" / "publish_queue.json"
 ACCOUNTS_FILE = ROOT / "accounts" / "tiktok_accounts.json"

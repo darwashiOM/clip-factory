@@ -5,19 +5,19 @@ import subprocess
 import tempfile
 from typing import Optional, List, Tuple, Dict
 
-from dotenv import load_dotenv
+from bootstrap import resolve_root_and_load_env
+
+ROOT = resolve_root_and_load_env()
+
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
 
 from helpers import get_ffmpeg, atomic_write_json
+import llm_client
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
 BROLL = ROOT / "broll"
 FINAL = ROOT / "final"
 
-load_dotenv(ROOT / ".env")
 
 mcp = FastMCP("asset-guard", json_response=True)
 
@@ -88,19 +88,13 @@ class AssetGuardReport(BaseModel):
     auto_reject_reasons: List[str] = Field(default_factory=list)
 
 
-def _client():
-    api_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is not set in environment or .env")
-    return genai.Client(api_key=api_key)
-
-
 def _vision_model_name() -> str:
-    return (
-        os.environ.get("GEMINI_VISION_MODEL")
-        or os.environ.get("GEMINI_MODEL")
-        or "gemini-2.5-pro"
-    )
+    # Legacy Gemini env vars for backwards compatibility
+    legacy = (os.environ.get("GEMINI_VISION_MODEL") or os.environ.get("GEMINI_MODEL") or "").strip()
+    if legacy:
+        return legacy
+    from llm_client import _vision_model_name as _vm
+    return _vm() or "gemini-2.5-pro"
 
 
 def _resolve_media_path(source_path: str) -> Path:
@@ -336,31 +330,70 @@ Return JSON matching the requested schema.
 """.strip()
 
 
-def _vision_inspect(frames: List[Path], technical: TechnicalInfo) -> VisionInspection:
-    client = _client()
+def _vision_stub() -> VisionInspection:
+    """Return a permissive stub when ASSET_GUARD_USE_VISION=false (the default)."""
+    ok = DetectionDecision(detected=False, confidence=0.0, evidence=["vision_disabled"])
+    return VisionInspection(
+        human_faces=ok,
+        animal_faces=ok,
+        text_or_logo=ok,
+        visual_artifacts=ok,
+        low_quality_generation=LowQualityResult(detected=False, confidence=0.0, issues=["vision_disabled"], technical_score=100),
+        non_scenic=ScenicResult(rejected=False, confidence=0.0, reasons=["vision_disabled"]),
+        cinematic_quality=CinematicQualityResult(score=80, reasons=["vision_disabled"], strengths=["not_inspected"]),
+        summary="Vision inspection disabled (ASSET_GUARD_USE_VISION=false). Technical checks only.",
+    )
+
+
+def _vision_inspect_gemini(frames: List[Path], technical: TechnicalInfo) -> VisionInspection:
+    """Call Gemini vision (legacy path)."""
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError as e:
+        raise RuntimeError("google-genai is required for Gemini vision inspection") from e
+
+    api_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is not set")
+
+    client = genai.Client(api_key=api_key)
     parts: List[object] = [_vision_prompt(technical)]
     for frame in frames:
-        parts.append(types.Part.from_bytes(data=frame.read_bytes(), mime_type=_mime_type_for(frame)))
+        parts.append(genai_types.Part.from_bytes(data=frame.read_bytes(), mime_type=_mime_type_for(frame)))
 
     response = client.models.generate_content(
         model=_vision_model_name(),
         contents=parts,
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": VisionInspection.model_json_schema(),
-            "temperature": 0.1,
-        },
+        config={"response_mime_type": "application/json",
+                "response_json_schema": VisionInspection.model_json_schema(),
+                "temperature": 0.1},
     )
-
     if getattr(response, "parsed", None) is not None:
         parsed = response.parsed
         if isinstance(parsed, VisionInspection):
             return parsed
         if isinstance(parsed, dict):
             return VisionInspection.model_validate(parsed)
-
     text = getattr(response, "text", "") or "{}"
     return VisionInspection.model_validate_json(text)
+
+
+def _vision_inspect(frames: List[Path], technical: TechnicalInfo) -> VisionInspection:
+    """Route vision inspection to the configured provider, or return a stub if disabled."""
+    if not llm_client.asset_guard_use_vision():
+        return _vision_stub()
+
+    vp = llm_client._vision_provider()
+    if vp in ("gemini", "disabled", "none", ""):
+        # Default: use Gemini if a key is present
+        return _vision_inspect_gemini(frames, technical)
+
+    # Future: add openai vision path here
+    raise RuntimeError(
+        f"VISION_MODEL_PROVIDER={vp!r} is not yet implemented for asset_guard. "
+        "Use 'gemini' or set ASSET_GUARD_USE_VISION=false."
+    )
 
 
 def _report_path_for(path: Path) -> Path:
@@ -432,9 +465,11 @@ def healthcheck() -> dict:
         "root": str(ROOT),
         "broll_exists": BROLL.exists(),
         "final_exists": FINAL.exists(),
-        "vision_model": _vision_model_name(),
+        "vision_model": _vision_model_name() if llm_client.asset_guard_use_vision() else "disabled",
+        "asset_guard_use_vision": llm_client.asset_guard_use_vision(),
         "ffmpeg": get_ffmpeg(),
         "has_gemini_key": bool((os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()),
+        "provider": llm_client.provider_summary(),
     }
 
 

@@ -6,16 +6,23 @@ import subprocess
 import tempfile
 from typing import Optional, List, Dict, Any
 
-from dotenv import load_dotenv
 from openai import OpenAI
 from mcp.server.fastmcp import FastMCP
-from helpers import clean_arabic_for_captions
+from helpers import clean_arabic_for_captions, get_ffmpeg
+from bootstrap import resolve_root_and_load_env
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+ROOT = resolve_root_and_load_env()
+
+def _ffprobe_bin() -> str:
+    ffmpeg_path = Path(get_ffmpeg())
+    ffprobe_candidate = ffmpeg_path.with_name("ffprobe")
+    return str(ffprobe_candidate) if ffprobe_candidate.exists() else "ffprobe"
+
+
+
 INCOMING = ROOT / "incoming"
 TRANSCRIPTS = ROOT / "transcripts"
 
-load_dotenv(ROOT / ".env")
 
 mcp = FastMCP("clip-factory-transcribe", json_response=True)
 
@@ -81,7 +88,7 @@ def _segments_to_srt(segments: List[Dict[str, Any]], clean: bool = False) -> str
 def _ffprobe_duration(src: Path) -> float:
     result = subprocess.run(
         [
-            "ffprobe",
+            _ffprobe_bin(),
             "-v",
             "error",
             "-show_entries",
@@ -136,7 +143,7 @@ def _extract_chunk_audio(src: Path, out_path: Path, start: float, duration: floa
     out_path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
-            "ffmpeg",
+            get_ffmpeg(),
             "-y",
             "-hide_banner",
             "-loglevel",
@@ -175,6 +182,7 @@ def _merge_chunk_segments(
 ) -> Dict[str, Any]:
     merged_segments: List[Dict[str, Any]] = []
     chunk_reports: List[Dict[str, Any]] = []
+    merged_words: List[Dict[str, Any]] = []
 
     for chunk in chunk_data:
         verbose_data = chunk["verbose_data"]
@@ -224,7 +232,41 @@ def _merge_chunk_segments(
             }
         )
 
+        raw_words = verbose_data.get("words") or []
+        for word in raw_words:
+            try:
+                rel_start = float(word.get("start", 0.0))
+                rel_end = float(word.get("end", rel_start))
+            except (TypeError, ValueError):
+                continue
+
+            abs_start = chunk["extract_start"] + rel_start
+            abs_end = chunk["extract_start"] + rel_end
+            midpoint = (abs_start + abs_end) / 2.0
+            keep_end = chunk["keep_end"]
+            keep_start = chunk["keep_start"]
+            is_last_chunk = chunk["index"] == len(chunk_data) - 1
+
+            if midpoint < keep_start:
+                continue
+            if midpoint >= keep_end and not is_last_chunk:
+                continue
+
+            token = str(word.get("word", "")).strip()
+            if not token:
+                continue
+
+            merged_words.append(
+                {
+                    "word": token,
+                    "start": round(max(0.0, abs_start), 3),
+                    "end": round(min(total_duration, max(abs_start, abs_end)), 3),
+                }
+            )
+
     merged_segments.sort(key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0))))
+
+    merged_words.sort(key=lambda w: (float(w.get("start", 0.0)), float(w.get("end", 0.0))))
 
     compact_segments: List[Dict[str, Any]] = []
     for seg in merged_segments:
@@ -246,6 +288,7 @@ def _merge_chunk_segments(
         "duration": round(total_duration, 3),
         "text": text,
         "segments": compact_segments,
+        "words": merged_words,
         "chunking": {
             "enabled": True,
             "chunk_count": len(chunk_data),
@@ -367,7 +410,7 @@ def transcribe_file(
                 target_chunk_path.write_bytes(chunk_path.read_bytes())
                 saved_chunk_path = str(target_chunk_path)
             else:
-                saved_chunk_path = str(chunk_path)
+                saved_chunk_path = ""
 
             with open(chunk_path, "rb") as f:
                 verbose_resp = client.audio.transcriptions.create(
@@ -375,6 +418,7 @@ def transcribe_file(
                     model="whisper-1",
                     response_format="verbose_json",
                     language=language,
+                    timestamp_granularities=["word", "segment"],
                 )
 
             verbose_data = _normalize_verbose_response(verbose_resp)
@@ -382,6 +426,7 @@ def transcribe_file(
                 {
                     **chunk,
                     "chunk_file": saved_chunk_path,
+                    "chunk_file_persisted": keep_chunk_files,
                     "verbose_data": verbose_data,
                 }
             )
@@ -416,6 +461,7 @@ def transcribe_file(
             {
                 "index": c["index"],
                 "chunk_file": c["chunk_file"],
+                "chunk_file_persisted": c.get("chunk_file_persisted", False),
                 "nominal_start": c["nominal_start"],
                 "nominal_end": c["nominal_end"],
                 "extract_start": c["extract_start"],

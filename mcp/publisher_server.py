@@ -9,14 +9,17 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from helpers import atomic_write_json
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+
+from bootstrap import resolve_root_and_load_env
+
+ROOT = resolve_root_and_load_env()
+
 POOL_DIR = ROOT / "pool"
 POOL_FILE = POOL_DIR / "video_pool.json"
 
 PUBLISHER_DIR = ROOT / "publisher"
 QUEUE_FILE = PUBLISHER_DIR / "publish_queue.json"
 
-load_dotenv(ROOT / ".env")
 
 mcp = FastMCP("clip-factory-publisher", json_response=True)
 

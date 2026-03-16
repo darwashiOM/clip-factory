@@ -6,16 +6,27 @@ from typing import List, Optional, Tuple, Dict
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from google import genai
 from mcp.server.fastmcp import FastMCP
 
 from helpers import atomic_write_json
+from bootstrap import resolve_root_and_load_env
+import llm_client
 
-ROOT = Path(os.environ.get("CLIP_FACTORY_ROOT", str(Path.home() / "clip-factory"))).resolve()
+ROOT = resolve_root_and_load_env()
+
 TRANSCRIPTS = ROOT / "transcripts"
 CLIPS = ROOT / "clips"
 
-load_dotenv(ROOT / ".env")
+# ── Visual plan timing ────────────────────────────────────────────────────────
+# Minimum seconds of speaker at the START before the first scenic insert.
+# Also used as the outro guard — minimum speaker seconds at the END.
+# Both are configurable via .env so operators can tune without touching code.
+# These default values are deliberately generous (calm Islamic-reflection style):
+#   3.0 s intro  — establish the speaker before any scenic cut
+#   2.5 s outro  — always land back on the speaker for the close
+_SPEAKER_HOLD_SECS: float = float(os.environ.get("SPEAKER_HOLD_SECS", "3.0"))
+_OUTRO_GUARD_SECS: float = float(os.environ.get("OUTRO_GUARD_SECS", "2.5"))
+
 
 mcp = FastMCP("clip-finder", json_response=True)
 
@@ -39,12 +50,12 @@ _CONTEXT_DEPENDENT_WORDS = {
 
 
 class VisualBeat(BaseModel):
-    type: str = Field(description="Either 'original' or 'ai_video'")
+    type: str = Field(description="'original' or 'stock_video' (real scenic clip)")
     start_offset_sec: float = Field(ge=0, description="Segment start relative to the clip start in seconds")
     end_offset_sec: float = Field(gt=0, description="Segment end relative to the clip start in seconds")
     duration_sec: float = Field(gt=0, description="Segment duration in seconds")
-    asset_slot: int = Field(default=0, ge=0, description="1-based generated asset slot for ai_video beats, or 0 for original")
-    prompt: str = Field(default="", description="Scenic prompt for ai_video beats")
+    asset_slot: int = Field(default=0, ge=0, description="1-based generated asset slot for stock_video beats, or 0 for original")
+    prompt: str = Field(default="", description="Scenic prompt or stock search hint for stock_video beats")
     notes: str = Field(default="", description="Optional notes for the renderer or generation layer")
 
 
@@ -83,28 +94,24 @@ class ClipPlan(BaseModel):
     clips: List[ClipCandidate]
 
 
-def _client():
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set in environment or .env")
-    return genai.Client(api_key=api_key)
-
-
 def _selection_model_name() -> str:
-    return (
+    # Legacy Gemini env vars keep working so existing configs aren't broken.
+    legacy = (
         os.environ.get("GEMINI_SELECTION_MODEL")
         or os.environ.get("GEMINI_MODEL")
-        or "gemini-2.5-pro"
-    )
+        or ""
+    ).strip()
+    return legacy or llm_client._text_model_name()
 
 
 def _rerank_model_name() -> str:
-    return (
+    legacy = (
         os.environ.get("GEMINI_RERANK_MODEL")
         or os.environ.get("GEMINI_SELECTION_MODEL")
         or os.environ.get("GEMINI_MODEL")
-        or "gemini-2.5-pro"
-    )
+        or ""
+    ).strip()
+    return legacy or llm_client._text_model_name()
 
 
 def _list_verbose_sources(limit: int = 50):
@@ -136,8 +143,8 @@ def _list_verbose_sources(limit: int = 50):
 
 def _load_source(stem: str):
     preferred_verbose = [
-        TRANSCRIPTS / f"{stem}.refined.verbose.json",
         TRANSCRIPTS / f"{stem}.quran_guard.verbose.json",
+        TRANSCRIPTS / f"{stem}.refined.verbose.json",
         TRANSCRIPTS / f"{stem}.verbose.json",
     ]
     preferred_txt = [
@@ -734,14 +741,42 @@ def _sanitize_visual_topic(raw: str) -> str:
     return cleaned or "serene natural landscape with soft cinematic motion"
 
 
-def _scenic_prompt_for_slot(base_topic: str, slot: int) -> str:
-    topic = _sanitize_visual_topic(base_topic)
-    templates = [
-        "Cinematic scenic shot of {topic}, subtle natural motion, photorealistic, vertical 9:16, no people, no human face, no hands, no animals, no birds, no insects, no text, no logos.",
-        "Moody atmospheric scene of {topic}, slow camera drift, rich natural light, photorealistic, vertical 9:16, empty environment only, no people, no faces, no animals, no text, no logos.",
-        "Beautiful environmental cutaway of {topic}, calm movement, high detail, photorealistic, vertical 9:16, scenery only, no humans, no faces, no living creatures, no text, no logos.",
+def _stock_query_for_clip(clip: "ClipCandidate", slot: int) -> str:
+    """
+    Return a short, search-friendly query for a stock footage provider.
+
+    Uses broll_query first (set by the Gemini clip finder); falls back to title.
+    Arabic text is replaced with a themed scenic fallback via _sanitize_visual_topic.
+    Slot is used to slightly diversify multi-slot queries (title vs broll_query).
+    """
+    _FALLBACK_QUERIES = [
+        "scenic nature landscape",
+        "misty mountains dawn",
+        "ocean waves shore",
+        "desert dunes sunset",
+        "river forest mist",
     ]
-    return templates[(slot - 1) % len(templates)].format(topic=topic)
+    if slot == 1 or not clip.title:
+        base = (clip.broll_query or clip.title or "").strip()
+    else:
+        # Second/third slot: prefer title for variety
+        base = (clip.title or clip.broll_query or "").strip()
+
+    # Strip clips that are fully Arabic — use themed mapping instead
+    if not base or all(ord(c) > 0x06FF or c.isspace() for c in base):
+        return _FALLBACK_QUERIES[(slot - 1) % len(_FALLBACK_QUERIES)]
+
+    # Run through the themed mapper so Quran/Islamic keywords map to good visuals
+    query = _sanitize_visual_topic(base)
+    # Keep it concise: stock search works better with shorter, focused phrases
+    return query[:80].strip()
+
+
+# Keep old name as alias so any external code that references it still works.
+def _scenic_prompt_for_slot(base_topic: str, slot: int) -> str:
+    """Legacy alias — use _stock_query_for_clip for new code."""
+    topic = _sanitize_visual_topic(base_topic)
+    return topic[:80].strip()
 
 
 def _planned_insert_count(duration: float) -> int:
@@ -775,13 +810,16 @@ def _build_visual_plan_for_clip(clip: ClipCandidate) -> List[VisualBeat]:
     if duration > 45:
         ai_len = 2.1 if insert_count == 2 else 1.8
 
-    intro_guard = 2.0
-    outro_guard = 2.1
+    # Use env-based guards so timing matches the renderer's SPEAKER_HOLD_SECS.
+    # intro_guard  = minimum speaker footage before the FIRST scenic insert.
+    # outro_guard  = minimum speaker footage held at the END of the clip.
+    intro_guard = _SPEAKER_HOLD_SECS
+    outro_guard = _OUTRO_GUARD_SECS
     centers_map = {1: [0.52], 2: [0.38, 0.72], 3: [0.28, 0.55, 0.80]}
     centers = centers_map.get(insert_count, [0.52])
 
     ai_beats: List[VisualBeat] = []
-    last_end = intro_guard - 0.6
+    last_end = max(0.0, intro_guard - 0.6)
     latest_start = max(intro_guard, duration - outro_guard - ai_len)
     for idx, frac in enumerate(centers, start=1):
         desired_start = max(intro_guard, duration * frac - ai_len / 2.0)
@@ -791,12 +829,12 @@ def _build_visual_plan_for_clip(clip: ClipCandidate) -> List[VisualBeat]:
         if end_offset - start_offset < 1.2:
             continue
         beat = VisualBeat(
-            type="ai_video",
+            type="stock_video",
             start_offset_sec=round(start_offset, 2),
             end_offset_sec=round(end_offset, 2),
             duration_sec=round(end_offset - start_offset, 2),
             asset_slot=idx,
-            prompt=_scenic_prompt_for_slot(clip.broll_query or clip.title or clip.hook, idx),
+            prompt=_stock_query_for_clip(clip, idx),
             notes=f"scenic_insert_{idx}",
         )
         ai_beats.append(beat)
@@ -913,7 +951,7 @@ def _coerce_clip_plan(data: dict, stem: str) -> ClipPlan:
 
 
 def _generate_window_candidates(
-    client,
+    llm: "llm_client.TextLLM",
     stem: str,
     transcript_context: str,
     window_segments: List[dict],
@@ -924,23 +962,126 @@ def _generate_window_candidates(
     max_seconds: int,
 ) -> ClipPlan:
     segment_text = _segments_to_prompt_text(window_segments, start_index=window_start_idx)
-    response = client.models.generate_content(
-        model=_selection_model_name(),
-        contents=_build_generation_prompt(
-            stem=stem,
-            transcript_context=transcript_context,
-            segment_text=segment_text,
-            max_candidates=max_candidates,
-            min_seconds=min_seconds,
-            max_seconds=max_seconds,
-            window_label=_window_label(window_start_idx, window_end_idx, window_segments),
-        ),
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": ClipPlan.model_json_schema(),
-        },
+    prompt = _build_generation_prompt(
+        stem=stem,
+        transcript_context=transcript_context,
+        segment_text=segment_text,
+        max_candidates=max_candidates,
+        min_seconds=min_seconds,
+        max_seconds=max_seconds,
+        window_label=_window_label(window_start_idx, window_end_idx, window_segments),
     )
-    return _coerce_clip_plan(json.loads(response.text), stem=stem)
+    raw = llm.generate_json(prompt)
+    return _coerce_clip_plan(json.loads(raw), stem=stem)
+
+
+def _heuristic_find_clips(
+    stem: str,
+    segments: List[dict],
+    min_seconds: int,
+    max_seconds: int,
+    max_clips: int,
+) -> ClipPlan:
+    """
+    Find clip candidates using pure heuristic scoring — no LLM required.
+    Used when CLIP_FINDER_USE_LLM=false.
+
+    Generates all valid (start, end) segment pairs in the duration window,
+    scores each with the existing deterministic scorer, deduplicates overlapping
+    results, and returns the top max_clips candidates.
+    """
+    n = len(segments)
+    scored: List[tuple] = []
+
+    for start_idx in range(n):
+        first_text = _segment_text(segments[start_idx])
+        # Skip windows that clearly continue a previous sentence
+        if _starts_with_continuation(first_text):
+            continue
+        start_t = _safe_float(segments[start_idx].get("start"))
+
+        for end_idx in range(start_idx, n):
+            end_t = _safe_float(segments[end_idx].get("end"))
+            duration = end_t - start_t
+
+            if duration < min_seconds:
+                continue
+            if duration > max_seconds:
+                break  # All further end_idx values will be longer
+
+            # Minimal stub so _score_variant can read clip.confidence
+            dummy = ClipCandidate(
+                title="",
+                hook="",
+                start_sec=start_t,
+                end_sec=end_t,
+                duration_sec=duration,
+                confidence=0.5,
+                why_it_works="",
+                add_broll=False,
+                broll_query="",
+            )
+            editorial, metrics, notes = _score_variant(
+                clip=dummy,
+                segments=segments,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                min_seconds=min_seconds,
+                max_seconds=max_seconds,
+            )
+            if editorial < 0:
+                continue
+            scored.append((editorial, metrics, notes, start_idx, end_idx, start_t, end_t, duration))
+
+    # Best first
+    scored.sort(key=lambda x: (-x[0], -x[7]))
+
+    # Build ClipCandidates, deduplicate heavy overlaps
+    raw_candidates: List[ClipCandidate] = []
+    for editorial, metrics, notes, start_idx, end_idx, start_t, end_t, duration in scored:
+        selected = segments[start_idx:end_idx + 1]
+        texts = [_segment_text(s) for s in selected if _segment_text(s)]
+        first_text = texts[0] if texts else ""
+
+        # Simple title: first 5 Arabic words
+        title_words = first_text.split()[:5]
+        title = " ".join(title_words) if title_words else f"clip_{len(raw_candidates)+1}"
+
+        broll_query = _sanitize_visual_topic(first_text)
+
+        cand = ClipCandidate(
+            title=title,
+            hook=(first_text[:100] or title),
+            start_sec=start_t,
+            end_sec=end_t,
+            duration_sec=duration,
+            confidence=round(min(1.0, max(0.0, editorial)), 3),
+            why_it_works=(
+                f"heuristic: editorial={editorial:.3f} "
+                f"begin={metrics.get('beginning', 0):.2f} "
+                f"end={metrics.get('ending', 0):.2f}"
+            ),
+            add_broll=(duration >= 18 and editorial > 0.55),
+            broll_query=broll_query,
+        )
+        raw_candidates.append(cand)
+
+    # Deduplicate: drop any candidate that heavily overlaps a higher-scoring one
+    deduped: List[ClipCandidate] = []
+    for cand in raw_candidates:
+        keep = True
+        for existing in deduped:
+            overlap = max(0.0, min(cand.end_sec, existing.end_sec) - max(cand.start_sec, existing.start_sec))
+            shorter = min(cand.duration_sec, existing.duration_sec)
+            if shorter > 0 and overlap / shorter >= 0.70:
+                keep = False
+                break
+        if keep:
+            deduped.append(cand)
+        if len(deduped) >= max_clips * 4:
+            break  # Have enough to work with
+
+    return ClipPlan(source_stem=stem, language="Arabic", clips=deduped)
 
 
 def _merge_candidate_plans(stem: str, plans: List[ClipPlan]) -> ClipPlan:
@@ -996,76 +1137,90 @@ def find_clips_from_stem(
     CLIPS.mkdir(parents=True, exist_ok=True)
 
     _, _, _, text_data, segments = _load_source(stem)
-    transcript_context = _trim_text(text_data, max_chars=18000)
-    windows = _segment_windows(segments, window_size=window_size_segments, stride=window_stride_segments)
+    use_llm = llm_client.clip_finder_use_llm()
 
-    client = _client()
-    per_window_candidates = max(4, min(8, (generation_count // max(1, len(windows))) + 2))
-
-    raw_plans: List[ClipPlan] = []
-    searched_windows: List[dict] = []
     window_failures: List[dict] = []
+    searched_windows: List[dict] = []
+    windows: List = []
+    per_window_candidates: int = 0
 
-    for start_idx, end_idx, window_segments in windows:
-        searched_windows.append(
-            {
+    if use_llm:
+        # ── LLM-assisted path (DeepSeek / OpenAI / Gemini) ───────────────────
+        transcript_context = _trim_text(text_data, max_chars=18000)
+        windows = _segment_windows(segments, window_size=window_size_segments, stride=window_stride_segments)
+        llm = llm_client.get_text_llm()
+        per_window_candidates = max(4, min(8, (generation_count // max(1, len(windows))) + 2))
+
+        raw_plans: List[ClipPlan] = []
+
+        for start_idx, end_idx, window_segments in windows:
+            searched_windows.append({
                 "start_segment": start_idx,
                 "end_segment": end_idx - 1,
                 "segment_count": len(window_segments),
                 "label": _window_label(start_idx, end_idx, window_segments),
-            }
-        )
-        try:
-            plan = _generate_window_candidates(
-                client=client,
-                stem=stem,
-                transcript_context=transcript_context,
-                window_segments=window_segments,
-                window_start_idx=start_idx,
-                window_end_idx=end_idx,
-                max_candidates=per_window_candidates,
-                min_seconds=min_seconds,
-                max_seconds=max_seconds,
-            )
-            raw_plans.append(plan)
-        except Exception as exc:
-            window_failures.append(
-                {
+            })
+            try:
+                plan = _generate_window_candidates(
+                    llm=llm,
+                    stem=stem,
+                    transcript_context=transcript_context,
+                    window_segments=window_segments,
+                    window_start_idx=start_idx,
+                    window_end_idx=end_idx,
+                    max_candidates=per_window_candidates,
+                    min_seconds=min_seconds,
+                    max_seconds=max_seconds,
+                )
+                raw_plans.append(plan)
+            except Exception as exc:
+                window_failures.append({
                     "start_segment": start_idx,
                     "end_segment": end_idx - 1,
                     "error": str(exc),
-                }
-            )
+                })
 
-    merged_generated_plan = _merge_candidate_plans(stem=stem, plans=raw_plans)
-    generated_plan = _normalize_plan(merged_generated_plan, segments=segments, min_seconds=min_seconds, max_seconds=max_seconds)
+        merged_generated_plan = _merge_candidate_plans(stem=stem, plans=raw_plans)
+        generated_plan = _normalize_plan(merged_generated_plan, segments=segments, min_seconds=min_seconds, max_seconds=max_seconds)
 
-    if generated_plan.clips:
-        rerank_response = client.models.generate_content(
-            model=_rerank_model_name(),
-            contents=_build_rerank_prompt(
-                stem=stem,
-                candidate_json=json.dumps(generated_plan.model_dump(), ensure_ascii=False, indent=2),
-                keep_count=max_clips,
-            ),
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": ClipPlan.model_json_schema(),
-            },
-        )
-        final_plan = _coerce_clip_plan(json.loads(rerank_response.text), stem=stem)
-        final_plan = _normalize_plan(final_plan, segments=segments, min_seconds=min_seconds, max_seconds=max_seconds)
+        if generated_plan.clips:
+            try:
+                rerank_raw = llm.generate_json(
+                    _build_rerank_prompt(
+                        stem=stem,
+                        candidate_json=json.dumps(generated_plan.model_dump(), ensure_ascii=False, indent=2),
+                        keep_count=max_clips,
+                    )
+                )
+                final_plan = _coerce_clip_plan(json.loads(rerank_raw), stem=stem)
+                final_plan = _normalize_plan(final_plan, segments=segments, min_seconds=min_seconds, max_seconds=max_seconds)
+            except Exception:
+                final_plan = generated_plan
+        else:
+            final_plan = ClipPlan(source_stem=stem, language="Arabic", clips=[])
+
+        if not final_plan.clips and generated_plan.clips:
+            final_plan = generated_plan
+
     else:
-        final_plan = ClipPlan(source_stem=stem, language="Arabic", clips=[])
-
-    if not final_plan.clips and generated_plan.clips:
+        # ── Heuristic path (no LLM — zero API cost) ──────────────────────────
+        raw_heuristic = _heuristic_find_clips(
+            stem=stem,
+            segments=segments,
+            min_seconds=min_seconds,
+            max_seconds=max_seconds,
+            max_clips=max_clips * 4,  # over-generate, then filter
+        )
+        generated_plan = _normalize_plan(raw_heuristic, segments=segments, min_seconds=min_seconds, max_seconds=max_seconds)
         final_plan = generated_plan
 
     final_plan.clips = final_plan.clips[:max_clips]
 
     output = final_plan.model_dump()
-    output["selection_model"] = _selection_model_name()
-    output["rerank_model"] = _rerank_model_name()
+    output["selection_model"] = _selection_model_name() if use_llm else "heuristic"
+    output["rerank_model"] = _rerank_model_name() if use_llm else "heuristic"
+    output["llm_provider"] = llm_client._text_provider() if use_llm else "none"
+    output["clip_finder_mode"] = "llm" if use_llm else "heuristic"
     output["generated_candidate_count"] = len(generated_plan.clips)
     output["boundary_validator"] = "windowed-complete-under60-v2"
     output["requested_duration_range"] = {"min_seconds": min_seconds, "max_seconds": max_seconds}
